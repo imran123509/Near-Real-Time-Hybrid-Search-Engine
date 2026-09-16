@@ -1,0 +1,14 @@
+services:
+  api:
+    build:
+      context: .
+      args:
+        SERVICE: api
+    ports:
+      - "8080:8080"
+
+  consumer:
+    build:
+      context: .
+      args:
+        SERVICE: consumer
