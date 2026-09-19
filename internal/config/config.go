@@ -1,168 +1,411 @@
-// Package config loads application settings from environment variables.
+// Package config loads and validates application settings from environment
+// variables. It is shared by the API and the consumer, and depends on nothing
+// but the standard library.
 package config
 
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// Config holds the settings for the API and consumer services. Settings a
-// service does not use may be left unset; each constructor validates the
-// fields it needs.
+// Config is the full set of settings for both services. Each service reads
+// only the groups it needs: the API uses App, Server, PostgreSQL, OpenSearch
+// and Qdrant; the consumer uses App, Kafka, Indexing, PostgreSQL, OpenSearch,
+// Qdrant and Gemini.
 type Config struct {
-	HTTPAddr    string
-	PostgresURL string
-	OpenSearch  OpenSearchConfig
-	Qdrant      QdrantConfig
-	Kafka       KafkaConfig
-	Gemini      GeminiConfig
+	App        AppConfig
+	Server     ServerConfig
+	PostgreSQL PostgreSQLConfig
+	Kafka      KafkaConfig
+	OpenSearch OpenSearchConfig
+	Qdrant     QdrantConfig
+	Indexing   IndexingConfig
+	Gemini     GeminiConfig
 }
 
-// OpenSearchConfig holds OpenSearch connection settings.
-type OpenSearchConfig struct {
-	Addresses []string
-	Username  string
-	Password  string
-	Index     string
+// AppConfig identifies the running service.
+type AppConfig struct {
+	Env  string // APP_ENV
+	Name string // APP_NAME
 }
 
-// QdrantConfig holds Qdrant gRPC connection settings.
-type QdrantConfig struct {
-	Host       string
-	Port       int
-	APIKey     string
-	UseTLS     bool
-	Collection string
+// ServerConfig holds HTTP server settings for the API.
+type ServerConfig struct {
+	Host            string        // HTTP_HOST
+	Port            int           // HTTP_PORT
+	ReadTimeout     time.Duration // HTTP_READ_TIMEOUT
+	WriteTimeout    time.Duration // HTTP_WRITE_TIMEOUT
+	IdleTimeout     time.Duration // HTTP_IDLE_TIMEOUT
+	ShutdownTimeout time.Duration // HTTP_SHUTDOWN_TIMEOUT
+}
+
+// Addr returns the host:port the HTTP server listens on.
+func (c ServerConfig) Addr() string {
+	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+}
+
+// PostgreSQLConfig holds the database connection string and pool settings.
+// URL contains credentials, so never log it.
+type PostgreSQLConfig struct {
+	URL string // DATABASE_URL
+
+	MaxConns int // DATABASE_MAX_CONNS
+	MinConns int // DATABASE_MIN_CONNS, warm connections kept open
+	// MaxConnLifetime is how long a connection may be reused before it is
+	// replaced, which also lets connections move to restarted database nodes.
+	MaxConnLifetime   time.Duration // DATABASE_MAX_CONN_LIFETIME
+	MaxConnIdleTime   time.Duration // DATABASE_MAX_CONN_IDLE_TIME
+	HealthCheckPeriod time.Duration // DATABASE_HEALTH_CHECK_PERIOD
+	ConnectTimeout    time.Duration // DATABASE_CONNECT_TIMEOUT
 }
 
 // KafkaConfig holds consumer settings.
 type KafkaConfig struct {
-	Brokers  []string
-	Topic    string
-	GroupID  string
-	DLQTopic string
-	// Workers is the number of goroutines indexing messages concurrently.
-	Workers int
-	// QueueSize is the number of messages buffered per worker.
-	QueueSize int
-	// MaxAttempts is how many times a message is tried before it is
-	// published to the dead-letter topic.
-	MaxAttempts int
+	Brokers       []string // KAFKA_BROKERS, comma-separated
+	Topic         string   // KAFKA_TOPIC
+	ConsumerGroup string   // KAFKA_CONSUMER_GROUP
+	DLQTopic      string   // KAFKA_DLQ_TOPIC, defaults to Topic + ".dlq"
+	Workers       int      // KAFKA_WORKERS
 }
 
-// GeminiConfig holds Gemini embedding API settings.
-type GeminiConfig struct {
-	APIKey     string
-	Model      string
-	Dimensions int
+// OpenSearchConfig holds OpenSearch connection settings. Password is a secret,
+// so never log it.
+type OpenSearchConfig struct {
+	URL      string // OPENSEARCH_URL
+	Username string // OPENSEARCH_USERNAME
+	Password string // OPENSEARCH_PASSWORD
+	Index    string // OPENSEARCH_INDEX
 }
 
-// Load reads configuration from the environment.
+// QdrantConfig holds Qdrant connection settings. APIKey is a secret, so never
+// log it.
 //
-//	HTTP_ADDR                    default ":8080"
-//	POSTGRES_URL                 required
-//	OPENSEARCH_ADDRESSES         comma-separated, default "http://localhost:9200"
-//	OPENSEARCH_USERNAME          optional
-//	OPENSEARCH_PASSWORD          optional
-//	OPENSEARCH_INDEX             default "documents"
-//	QDRANT_HOST                  default "localhost"
-//	QDRANT_PORT                  default 6334
-//	QDRANT_API_KEY               optional
-//	QDRANT_USE_TLS               default false
-//	QDRANT_COLLECTION            default "documents"
-//	KAFKA_BROKERS                comma-separated, required by the consumer
-//	KAFKA_TOPIC                  default "document-events"
-//	KAFKA_GROUP_ID               default "search-indexer"
-//	KAFKA_DLQ_TOPIC              default KAFKA_TOPIC + ".dlq"
-//	KAFKA_WORKERS                default 10
-//	KAFKA_QUEUE_SIZE             default 8 (per worker)
-//	KAFKA_MAX_ATTEMPTS           default 5
-//	GEMINI_API_KEY               required by the consumer
-//	GEMINI_EMBEDDING_MODEL       default "gemini-embedding-2"
-//	GEMINI_EMBEDDING_DIMENSIONS  default 768
+// URL must point at Qdrant's gRPC endpoint, which listens on port 6334 by
+// default, not the REST endpoint on 6333, because the client speaks gRPC.
+// Host, Port and UseTLS are derived from URL by Load.
+type QdrantConfig struct {
+	URL        string // QDRANT_URL
+	APIKey     string // QDRANT_API_KEY
+	Collection string // QDRANT_COLLECTION
+	// VectorSize is the dimension of every stored vector. It must equal the
+	// embedding model's output size, so it defaults to
+	// GEMINI_EMBEDDING_DIMENSIONS and Load rejects a mismatch.
+	VectorSize int // QDRANT_VECTOR_SIZE
+
+	Host   string
+	Port   int
+	UseTLS bool
+}
+
+// IndexingConfig holds worker pool and retry settings for the consumer.
+type IndexingConfig struct {
+	Workers   int // INDEXING_WORKERS
+	QueueSize int // INDEXING_QUEUE_SIZE, buffered messages across all workers
+	BatchSize int // INDEXING_BATCH_SIZE
+	// RetryAttempts is the total number of tries per message, including the
+	// first one.
+	RetryAttempts int // INDEXING_RETRY_ATTEMPTS
+}
+
+// GeminiConfig holds embedding API settings for the consumer. APIKey is a
+// secret, so never log it.
+type GeminiConfig struct {
+	APIKey     string // GEMINI_API_KEY
+	Model      string // GEMINI_EMBEDDING_MODEL
+	Dimensions int    // GEMINI_EMBEDDING_DIMENSIONS
+}
+
+// Load reads the environment, applies defaults, parses values and validates
+// them. It reports every problem it finds rather than only the first, and
+// never logs secrets.
+//
+// Required: DATABASE_URL, KAFKA_BROKERS, KAFKA_TOPIC, KAFKA_CONSUMER_GROUP,
+// OPENSEARCH_URL, QDRANT_URL. The consumer additionally needs GEMINI_API_KEY,
+// which its embedding client checks.
 func Load() (Config, error) {
+	var e env
+
 	cfg := Config{
-		HTTPAddr:    getEnv("HTTP_ADDR", ":8080"),
-		PostgresURL: os.Getenv("POSTGRES_URL"),
+		App: AppConfig{
+			Env:  getEnv("APP_ENV", "development"),
+			Name: getEnv("APP_NAME", "near-realtime-search"),
+		},
+		Server: ServerConfig{
+			Host:            getEnv("HTTP_HOST", "0.0.0.0"),
+			Port:            e.int("HTTP_PORT", 8080),
+			ReadTimeout:     e.duration("HTTP_READ_TIMEOUT", 10*time.Second),
+			WriteTimeout:    e.duration("HTTP_WRITE_TIMEOUT", 10*time.Second),
+			IdleTimeout:     e.duration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+			ShutdownTimeout: e.duration("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+		},
+		PostgreSQL: PostgreSQLConfig{
+			URL:               e.required("DATABASE_URL"),
+			MaxConns:          e.int("DATABASE_MAX_CONNS", 25),
+			MinConns:          e.int("DATABASE_MIN_CONNS", 2),
+			MaxConnLifetime:   e.duration("DATABASE_MAX_CONN_LIFETIME", time.Hour),
+			MaxConnIdleTime:   e.duration("DATABASE_MAX_CONN_IDLE_TIME", 30*time.Minute),
+			HealthCheckPeriod: e.duration("DATABASE_HEALTH_CHECK_PERIOD", time.Minute),
+			ConnectTimeout:    e.duration("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
+		},
+		Kafka: KafkaConfig{
+			Brokers:       e.requiredList("KAFKA_BROKERS"),
+			Topic:         e.required("KAFKA_TOPIC"),
+			ConsumerGroup: e.required("KAFKA_CONSUMER_GROUP"),
+			Workers:       e.int("KAFKA_WORKERS", 10),
+		},
 		OpenSearch: OpenSearchConfig{
-			Addresses: splitList(getEnv("OPENSEARCH_ADDRESSES", "http://localhost:9200")),
-			Username:  os.Getenv("OPENSEARCH_USERNAME"),
-			Password:  os.Getenv("OPENSEARCH_PASSWORD"),
-			Index:     getEnv("OPENSEARCH_INDEX", "documents"),
+			URL:      e.required("OPENSEARCH_URL"),
+			Username: os.Getenv("OPENSEARCH_USERNAME"),
+			Password: os.Getenv("OPENSEARCH_PASSWORD"),
+			Index:    getEnv("OPENSEARCH_INDEX", "documents"),
 		},
 		Qdrant: QdrantConfig{
-			Host:       getEnv("QDRANT_HOST", "localhost"),
+			URL:        e.required("QDRANT_URL"),
 			APIKey:     os.Getenv("QDRANT_API_KEY"),
 			Collection: getEnv("QDRANT_COLLECTION", "documents"),
 		},
-		Kafka: KafkaConfig{
-			Brokers: splitList(os.Getenv("KAFKA_BROKERS")),
-			Topic:   getEnv("KAFKA_TOPIC", "document-events"),
-			GroupID: getEnv("KAFKA_GROUP_ID", "search-indexer"),
+		Indexing: IndexingConfig{
+			Workers:       e.int("INDEXING_WORKERS", 10),
+			QueueSize:     e.int("INDEXING_QUEUE_SIZE", 1000),
+			BatchSize:     e.int("INDEXING_BATCH_SIZE", 100),
+			RetryAttempts: e.int("INDEXING_RETRY_ATTEMPTS", 3),
 		},
 		Gemini: GeminiConfig{
-			APIKey: os.Getenv("GEMINI_API_KEY"),
-			Model:  getEnv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2"),
+			APIKey:     os.Getenv("GEMINI_API_KEY"),
+			Model:      getEnv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2"),
+			Dimensions: e.int("GEMINI_EMBEDDING_DIMENSIONS", 768),
 		},
 	}
 	cfg.Kafka.DLQTopic = getEnv("KAFKA_DLQ_TOPIC", cfg.Kafka.Topic+".dlq")
+	cfg.Qdrant.VectorSize = e.int("QDRANT_VECTOR_SIZE", cfg.Gemini.Dimensions)
 
-	if cfg.PostgresURL == "" {
-		return Config{}, errors.New("POSTGRES_URL is required")
-	}
-
-	var err error
-	if cfg.Qdrant.Port, err = getEnvInt("QDRANT_PORT", 6334); err != nil {
-		return Config{}, err
-	}
-	if cfg.Qdrant.UseTLS, err = strconv.ParseBool(getEnv("QDRANT_USE_TLS", "false")); err != nil {
-		return Config{}, fmt.Errorf("parse QDRANT_USE_TLS: %w", err)
-	}
-	if cfg.Kafka.Workers, err = getEnvInt("KAFKA_WORKERS", 10); err != nil {
-		return Config{}, err
-	}
-	if cfg.Kafka.QueueSize, err = getEnvInt("KAFKA_QUEUE_SIZE", 8); err != nil {
-		return Config{}, err
-	}
-	if cfg.Kafka.MaxAttempts, err = getEnvInt("KAFKA_MAX_ATTEMPTS", 5); err != nil {
-		return Config{}, err
-	}
-	if cfg.Gemini.Dimensions, err = getEnvInt("GEMINI_EMBEDDING_DIMENSIONS", 768); err != nil {
+	if err := e.err(); err != nil {
 		return Config{}, err
 	}
 
+	host, port, useTLS, err := splitEndpoint(cfg.Qdrant.URL, 6334)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid QDRANT_URL: %w", err)
+	}
+	cfg.Qdrant.Host, cfg.Qdrant.Port, cfg.Qdrant.UseTLS = host, port, useTLS
+
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
 }
 
+// validate checks value ranges that parsing alone cannot catch.
+func (c Config) validate() error {
+	var errs []error
+	add := func(err error) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.Server.Port < 1 || c.Server.Port > 65535 {
+		add(fmt.Errorf("HTTP_PORT must be between 1 and 65535, got %d", c.Server.Port))
+	}
+	for _, d := range []struct {
+		key   string
+		value time.Duration
+	}{
+		{"HTTP_READ_TIMEOUT", c.Server.ReadTimeout},
+		{"HTTP_WRITE_TIMEOUT", c.Server.WriteTimeout},
+		{"HTTP_IDLE_TIMEOUT", c.Server.IdleTimeout},
+		{"HTTP_SHUTDOWN_TIMEOUT", c.Server.ShutdownTimeout},
+		{"DATABASE_MAX_CONN_LIFETIME", c.PostgreSQL.MaxConnLifetime},
+		{"DATABASE_MAX_CONN_IDLE_TIME", c.PostgreSQL.MaxConnIdleTime},
+		{"DATABASE_HEALTH_CHECK_PERIOD", c.PostgreSQL.HealthCheckPeriod},
+		{"DATABASE_CONNECT_TIMEOUT", c.PostgreSQL.ConnectTimeout},
+	} {
+		if d.value <= 0 {
+			add(fmt.Errorf("%s must be positive, got %s", d.key, d.value))
+		}
+	}
+	for _, n := range []struct {
+		key   string
+		value int
+	}{
+		{"DATABASE_MAX_CONNS", c.PostgreSQL.MaxConns},
+		{"KAFKA_WORKERS", c.Kafka.Workers},
+		{"INDEXING_WORKERS", c.Indexing.Workers},
+		{"INDEXING_QUEUE_SIZE", c.Indexing.QueueSize},
+		{"INDEXING_BATCH_SIZE", c.Indexing.BatchSize},
+		{"INDEXING_RETRY_ATTEMPTS", c.Indexing.RetryAttempts},
+		{"GEMINI_EMBEDDING_DIMENSIONS", c.Gemini.Dimensions},
+		{"QDRANT_VECTOR_SIZE", c.Qdrant.VectorSize},
+	} {
+		if n.value <= 0 {
+			add(fmt.Errorf("%s must be positive, got %d", n.key, n.value))
+		}
+	}
+	if c.PostgreSQL.MinConns < 0 {
+		add(fmt.Errorf("DATABASE_MIN_CONNS must not be negative, got %d", c.PostgreSQL.MinConns))
+	}
+	if c.PostgreSQL.MinConns > c.PostgreSQL.MaxConns {
+		add(fmt.Errorf("DATABASE_MIN_CONNS (%d) must not exceed DATABASE_MAX_CONNS (%d)",
+			c.PostgreSQL.MinConns, c.PostgreSQL.MaxConns))
+	}
+	add(checkURL("OPENSEARCH_URL", c.OpenSearch.URL))
+	if c.OpenSearch.Index == "" {
+		add(errors.New("OPENSEARCH_INDEX must not be empty"))
+	}
+	if c.Qdrant.Collection == "" {
+		add(errors.New("QDRANT_COLLECTION must not be empty"))
+	}
+	// Qdrant rejects every vector whose length differs from the collection's.
+	if c.Qdrant.VectorSize != c.Gemini.Dimensions {
+		add(fmt.Errorf("QDRANT_VECTOR_SIZE (%d) must match GEMINI_EMBEDDING_DIMENSIONS (%d)",
+			c.Qdrant.VectorSize, c.Gemini.Dimensions))
+	}
+	if c.Gemini.Model == "" {
+		add(errors.New("GEMINI_EMBEDDING_MODEL must not be empty"))
+	}
+
+	return errors.Join(errs...)
+}
+
+// env records the errors from a series of lookups so that Load can report
+// every problem at once instead of only the first.
+type env struct {
+	errs []error
+}
+
+func (e *env) required(key string) string {
+	v, err := getRequiredEnv(key)
+	e.add(err)
+	return v
+}
+
+func (e *env) requiredList(key string) []string {
+	v, err := getRequiredList(key)
+	e.add(err)
+	return v
+}
+
+func (e *env) int(key string, fallback int) int {
+	v, err := getEnvInt(key, fallback)
+	e.add(err)
+	return v
+}
+
+func (e *env) duration(key string, fallback time.Duration) time.Duration {
+	v, err := getEnvDuration(key, fallback)
+	e.add(err)
+	return v
+}
+
+func (e *env) add(err error) {
+	if err != nil {
+		e.errs = append(e.errs, err)
+	}
+}
+
+// err returns all collected errors joined together, or nil when there are none.
+func (e *env) err() error {
+	return errors.Join(e.errs...)
+}
+
+// getEnv returns the value of key, or fallback when it is unset or empty.
 func getEnv(key, fallback string) string {
-	if v, ok := os.LookupEnv(key); ok && v != "" {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
 	}
 	return fallback
 }
 
-// getEnvInt parses key as a positive integer.
-func getEnvInt(key string, fallback int) (int, error) {
-	v := getEnv(key, strconv.Itoa(fallback))
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("parse %s: %w", key, err)
+// getRequiredEnv returns the value of key, or an error when it is unset or empty.
+func getRequiredEnv(key string) (string, error) {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v, nil
 	}
-	if n <= 0 {
-		return 0, fmt.Errorf("%s must be positive, got %d", key, n)
+	return "", fmt.Errorf("%s is required", key)
+}
+
+// getEnvInt parses key as an integer. Range checks belong in validate.
+func getEnvInt(key string, fallback int) (int, error) {
+	raw := getEnv(key, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return n, nil
 }
 
-func splitList(s string) []string {
-	var out []string
-	for _, item := range strings.Split(s, ",") {
+// getEnvDuration parses key as a Go duration such as "10s" or "1m30s".
+func getEnvDuration(key string, fallback time.Duration) (time.Duration, error) {
+	raw := getEnv(key, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return d, nil
+}
+
+// getRequiredList parses key as a comma-separated list with at least one item.
+func getRequiredList(key string) ([]string, error) {
+	var items []string
+	for _, item := range strings.Split(os.Getenv(key), ",") {
 		if item = strings.TrimSpace(item); item != "" {
-			out = append(out, item)
+			items = append(items, item)
 		}
 	}
-	return out
+	if len(items) == 0 {
+		return nil, fmt.Errorf("%s is required", key)
+	}
+	return items, nil
+}
+
+func checkURL(key, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", key, err)
+	}
+	if u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("invalid %s: want http(s)://host[:port], got %q", key, raw)
+	}
+	return nil
+}
+
+// splitEndpoint breaks a URL into host, port and whether TLS is used, applying
+// defaultPort when the URL leaves the port out.
+func splitEndpoint(raw string, defaultPort int) (host string, port int, useTLS bool, err error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", 0, false, err
+	}
+	if u.Host == "" {
+		return "", 0, false, fmt.Errorf("want scheme://host[:port], got %q", raw)
+	}
+
+	host = u.Hostname()
+	port = defaultPort
+	if p := u.Port(); p != "" {
+		if port, err = strconv.Atoi(p); err != nil {
+			return "", 0, false, fmt.Errorf("invalid port in %q: %w", raw, err)
+		}
+	}
+	switch u.Scheme {
+	case "https", "grpcs":
+		useTLS = true
+	case "http", "grpc":
+		useTLS = false
+	default:
+		return "", 0, false, fmt.Errorf("unsupported scheme %q in %q", u.Scheme, raw)
+	}
+	return host, port, useTLS, nil
 }

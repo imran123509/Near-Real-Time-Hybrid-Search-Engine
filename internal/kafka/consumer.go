@@ -61,7 +61,7 @@ func NewConsumer(ctx context.Context, cfg config.KafkaConfig, logger *slog.Logge
 	if len(cfg.Brokers) == 0 {
 		return nil, errors.New("KAFKA_BROKERS is required")
 	}
-	if cfg.Topic == "" || cfg.GroupID == "" {
+	if cfg.Topic == "" || cfg.ConsumerGroup == "" {
 		return nil, errors.New("kafka topic and group id are required")
 	}
 	if err := checkTopic(ctx, cfg.Brokers, cfg.Topic); err != nil {
@@ -70,7 +70,7 @@ func NewConsumer(ctx context.Context, cfg config.KafkaConfig, logger *slog.Logge
 
 	reader := kafkago.NewReader(kafkago.ReaderConfig{
 		Brokers:        cfg.Brokers,
-		GroupID:        cfg.GroupID,
+		GroupID:        cfg.ConsumerGroup,
 		Topic:          cfg.Topic,
 		StartOffset:    kafkago.FirstOffset,
 		CommitInterval: commitInterval,

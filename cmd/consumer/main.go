@@ -17,7 +17,8 @@ import (
 	"near-real-time-hybrid-search-engine/internal/indexing"
 	"near-real-time-hybrid-search-engine/internal/kafka"
 	"near-real-time-hybrid-search-engine/internal/postgres"
-	"near-real-time-hybrid-search-engine/internal/search"
+	"near-real-time-hybrid-search-engine/internal/search/opensearch"
+	"near-real-time-hybrid-search-engine/internal/search/qdrant"
 )
 
 const (
@@ -48,32 +49,41 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	logger.Info("starting consumer",
-		"topic", cfg.Kafka.Topic, "group", cfg.Kafka.GroupID, "dlq_topic", cfg.Kafka.DLQTopic,
-		"workers", cfg.Kafka.Workers, "queue_size", cfg.Kafka.QueueSize)
+		"app", cfg.App.Name, "env", cfg.App.Env,
+		"topic", cfg.Kafka.Topic, "group", cfg.Kafka.ConsumerGroup, "dlq_topic", cfg.Kafka.DLQTopic,
+		"workers", cfg.Indexing.Workers, "queue_size", cfg.Indexing.QueueSize,
+		"retry_attempts", cfg.Indexing.RetryAttempts)
 
 	initCtx, cancelInit := context.WithTimeout(ctx, startupTimeout)
 	defer cancelInit()
 
-	db, err := postgres.NewPool(initCtx, cfg.PostgresURL)
+	db, err := postgres.New(initCtx, cfg.PostgreSQL)
 	if err != nil {
 		return fmt.Errorf("init postgres: %w", err)
 	}
 	defer closeWithLog(logger, "postgres", func() error { db.Close(); return nil })
-	logger.Info("connected to postgres")
+	logger.Info("connected to postgres",
+		"max_conns", cfg.PostgreSQL.MaxConns, "min_conns", cfg.PostgreSQL.MinConns)
 
-	osClient, err := search.NewOpenSearchClient(initCtx, cfg.OpenSearch)
+	osClient, err := opensearch.New(cfg.OpenSearch)
 	if err != nil {
 		return fmt.Errorf("init opensearch: %w", err)
 	}
 	defer closeWithLog(logger, "opensearch", osClient.Close)
-	logger.Info("connected to opensearch")
+	if err := osClient.Ping(initCtx); err != nil {
+		return fmt.Errorf("init opensearch: %w", err)
+	}
+	logger.Info("connected to opensearch", "index", cfg.OpenSearch.Index)
 
-	qdClient, err := search.NewQdrantClient(initCtx, cfg.Qdrant)
+	qdClient, err := qdrant.New(cfg.Qdrant)
 	if err != nil {
 		return fmt.Errorf("init qdrant: %w", err)
 	}
 	defer closeWithLog(logger, "qdrant", qdClient.Close)
-	logger.Info("connected to qdrant")
+	if err := qdClient.Ping(initCtx); err != nil {
+		return fmt.Errorf("init qdrant: %w", err)
+	}
+	logger.Info("connected to qdrant", "collection", cfg.Qdrant.Collection, "vector_size", cfg.Qdrant.VectorSize)
 
 	embedder, err := embedding.NewClient(cfg.Gemini)
 	if err != nil {
@@ -93,19 +103,18 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeWithLog(logger, "kafka dead-letter writer", deadLetters.Close)
 
-	indexer := indexing.NewIndexer(postgres.NewRepository(db), embedder, osClient, qdClient,
-		cfg.OpenSearch.Index, cfg.Qdrant.Collection)
-	if err := indexer.EnsureStores(initCtx, cfg.Gemini.Dimensions); err != nil {
+	indexer := indexing.NewIndexer(postgres.NewRepository(db), embedder, osClient, qdClient)
+	if err := indexer.EnsureStores(initCtx); err != nil {
 		return fmt.Errorf("init search stores: %w", err)
 	}
-	pipeline := indexing.NewPipeline(indexer, deadLetters, cfg.Kafka.MaxAttempts, logger)
+	pipeline := indexing.NewPipeline(indexer, deadLetters, cfg.Indexing.RetryAttempts, logger)
 
 	// consumeCtx stops fetching on a shutdown signal, or when a worker reports
 	// a failure that makes it unsafe to keep committing offsets.
 	consumeCtx, stopConsuming := context.WithCancelCause(ctx)
 	defer stopConsuming(nil)
 
-	workers, err := indexing.NewWorkerPool(cfg.Kafka.Workers, cfg.Kafka.QueueSize, pipeline.Process, stopConsuming, logger)
+	workers, err := indexing.NewWorkerPool(cfg.Indexing.Workers, cfg.Indexing.QueueSize, pipeline.Process, stopConsuming, logger)
 	if err != nil {
 		return fmt.Errorf("init worker pool: %w", err)
 	}

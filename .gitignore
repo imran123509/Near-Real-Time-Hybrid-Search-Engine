@@ -1,0 +1,12 @@
+# Local environment files; .env.example stays committed
+.env
+.env.*
+!.env.example
+
+# Build output
+/bin/
+*.exe
+
+# Test and coverage output
+*.test
+*.out

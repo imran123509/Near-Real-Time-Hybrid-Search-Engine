@@ -17,15 +17,13 @@ import (
 	"near-real-time-hybrid-search-engine/internal/config"
 	"near-real-time-hybrid-search-engine/internal/postgres"
 	"near-real-time-hybrid-search-engine/internal/search"
+	"near-real-time-hybrid-search-engine/internal/search/opensearch"
+	"near-real-time-hybrid-search-engine/internal/search/qdrant"
 )
 
 const (
 	startupTimeout    = 10 * time.Second
 	readHeaderTimeout = 5 * time.Second
-	readTimeout       = 10 * time.Second
-	writeTimeout      = 30 * time.Second
-	idleTimeout       = 120 * time.Second
-	shutdownTimeout   = 15 * time.Second
 )
 
 func main() {
@@ -49,12 +47,12 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	logger.Info("starting api", "addr", cfg.HTTPAddr)
+	logger.Info("starting api", "app", cfg.App.Name, "env", cfg.App.Env, "addr", cfg.Server.Addr())
 
 	initCtx, cancelInit := context.WithTimeout(ctx, startupTimeout)
 	defer cancelInit()
 
-	pool, err := postgres.NewPool(initCtx, cfg.PostgresURL)
+	pool, err := postgres.New(initCtx, cfg.PostgreSQL)
 	if err != nil {
 		return fmt.Errorf("init postgres: %w", err)
 	}
@@ -62,32 +60,39 @@ func run(logger *slog.Logger) error {
 		pool.Close()
 		logger.Info("postgres pool closed")
 	}()
-	logger.Info("connected to postgres")
+	logger.Info("connected to postgres",
+		"max_conns", cfg.PostgreSQL.MaxConns, "min_conns", cfg.PostgreSQL.MinConns)
 
-	osClient, err := search.NewOpenSearchClient(initCtx, cfg.OpenSearch)
+	osClient, err := opensearch.New(cfg.OpenSearch)
 	if err != nil {
 		return fmt.Errorf("init opensearch: %w", err)
 	}
 	defer closeWithLog(logger, "opensearch", osClient.Close)
-	logger.Info("connected to opensearch")
+	if err := osClient.Ping(initCtx); err != nil {
+		return fmt.Errorf("init opensearch: %w", err)
+	}
+	logger.Info("connected to opensearch", "index", cfg.OpenSearch.Index)
 
-	qdClient, err := search.NewQdrantClient(initCtx, cfg.Qdrant)
+	qdClient, err := qdrant.New(cfg.Qdrant)
 	if err != nil {
 		return fmt.Errorf("init qdrant: %w", err)
 	}
 	defer closeWithLog(logger, "qdrant", qdClient.Close)
-	logger.Info("connected to qdrant")
+	if err := qdClient.Ping(initCtx); err != nil {
+		return fmt.Errorf("init qdrant: %w", err)
+	}
+	logger.Info("connected to qdrant", "collection", cfg.Qdrant.Collection, "vector_size", cfg.Qdrant.VectorSize)
 
 	svc := search.NewService(osClient, qdClient, postgres.NewRepository(pool))
 	handler := api.NewHandler(svc, logger)
 
 	srv := &http.Server{
-		Addr:              cfg.HTTPAddr,
+		Addr:              cfg.Server.Addr(),
 		Handler:           api.NewRouter(handler),
 		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
+		ReadTimeout:       cfg.Server.ReadTimeout,
+		WriteTimeout:      cfg.Server.WriteTimeout,
+		IdleTimeout:       cfg.Server.IdleTimeout,
 		BaseContext:       func(net.Listener) context.Context { return rootCtx },
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
@@ -108,7 +113,7 @@ func run(logger *slog.Logger) error {
 		logger.Info("shutdown signal received")
 	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancelShutdown()
 
 	err = srv.Shutdown(shutdownCtx)

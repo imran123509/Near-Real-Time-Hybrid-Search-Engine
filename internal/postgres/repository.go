@@ -1,4 +1,3 @@
-// Package postgres provides PostgreSQL access for documents.
 package postgres
 
 import (
@@ -13,20 +12,6 @@ import (
 
 // ErrNotFound is returned when a document does not exist.
 var ErrNotFound = errors.New("document not found")
-
-// NewPool creates a connection pool and verifies the database is reachable.
-// The caller owns the pool and must call Close.
-func NewPool(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
-	if err != nil {
-		return nil, fmt.Errorf("create pool: %w", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
-	}
-	return pool, nil
-}
 
 // Document is the source-of-truth copy of a searchable document.
 type Document struct {

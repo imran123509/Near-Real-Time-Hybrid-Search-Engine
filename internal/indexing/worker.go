@@ -22,7 +22,7 @@ type Handler func(ctx context.Context, msg kafka.Message) error
 // Kafka consumer does not fetch another message until Submit returns. When
 // OpenSearch, Qdrant or Gemini slow down, workers take longer, queues fill, and
 // consumption slows to match. Memory and goroutines stay bounded by
-// workers × (queueSize + 1) messages, whatever the topic's traffic.
+// workers + queueSize messages, whatever the topic's traffic.
 //
 // Ordering: messages are routed by Kafka key (the document ID), so all events
 // for a document go to the same worker and are processed in order. Two
@@ -39,16 +39,18 @@ type WorkerPool struct {
 	cancel   context.CancelFunc
 }
 
-// NewWorkerPool returns a pool of workers with queueSize buffered messages
-// each. onFatal is called when a message fails in a way that means consumption
-// must stop, such as a failed dead-letter publish.
+// NewWorkerPool returns a pool of workers sharing queueSize buffered messages,
+// split evenly between them with at least one each. onFatal is called when a
+// message fails in a way that means consumption must stop, such as a failed
+// dead-letter publish.
 func NewWorkerPool(workers, queueSize int, handler Handler, onFatal func(error), logger *slog.Logger) (*WorkerPool, error) {
 	if workers <= 0 || queueSize <= 0 {
 		return nil, fmt.Errorf("workers and queue size must be positive, got %d and %d", workers, queueSize)
 	}
+	perWorker := max(queueSize/workers, 1)
 	queues := make([]chan kafka.Message, workers)
 	for i := range queues {
-		queues[i] = make(chan kafka.Message, queueSize)
+		queues[i] = make(chan kafka.Message, perWorker)
 	}
 	return &WorkerPool{
 		queues:  queues,
