@@ -37,8 +37,8 @@ func (f *fakeDeadLetters) Publish(_ context.Context, _ kafka.Message, cause erro
 	return f.err
 }
 
-func newTestPipeline(ix EventIndexer, dlq DeadLetterPublisher, maxAttempts int) *Pipeline {
-	p := NewPipeline(ix, dlq, maxAttempts, slog.New(slog.DiscardHandler))
+func newTestPipeline(ix EventIndexer[Event], dlq DeadLetterPublisher, maxAttempts int) *Pipeline[Event] {
+	p := NewPipeline(DecodeEvent, ix, dlq, maxAttempts, slog.New(slog.DiscardHandler))
 	p.backoff = func(int) time.Duration { return 0 }
 	return p
 }

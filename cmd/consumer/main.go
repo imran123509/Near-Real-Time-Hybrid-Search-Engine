@@ -107,7 +107,7 @@ func run(logger *slog.Logger) error {
 	if err := indexer.EnsureStores(initCtx); err != nil {
 		return fmt.Errorf("init search stores: %w", err)
 	}
-	pipeline := indexing.NewPipeline(indexer, deadLetters, cfg.Indexing.RetryAttempts, logger)
+	pipeline := indexing.NewPipeline(indexing.DecodeEvent, indexer, deadLetters, cfg.Indexing.RetryAttempts, logger)
 
 	// consumeCtx stops fetching on a shutdown signal, or when a worker reports
 	// a failure that makes it unsafe to keep committing offsets.

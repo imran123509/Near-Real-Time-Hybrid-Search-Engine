@@ -60,11 +60,7 @@ func (ix *Indexer) Index(ctx context.Context, ev Event) error {
 	// Embed first so a Gemini failure leaves both stores untouched.
 	vector, err := ix.embedder.EmbedDocument(ctx, doc.Title, doc.Body)
 	if err != nil {
-		var apiErr *embedding.APIError
-		if errors.As(err, &apiErr) && !apiErr.Temporary() {
-			err = permanent(err)
-		}
-		return fmt.Errorf("embed document: %w", err)
+		return fmt.Errorf("embed document: %w", classifyEmbedding(err))
 	}
 
 	err = ix.keyword.IndexDocument(ctx, opensearch.Document{
@@ -109,6 +105,16 @@ func (ix *Indexer) EnsureStores(ctx context.Context) error {
 		return fmt.Errorf("ensure qdrant collection: %w", err)
 	}
 	return nil
+}
+
+// classifyEmbedding marks an embedding API response that retrying cannot fix
+// as permanent. Rate limits, timeouts and 5xx stay retryable.
+func classifyEmbedding(err error) error {
+	var apiErr *embedding.APIError
+	if errors.As(err, &apiErr) && !apiErr.Temporary() {
+		return permanent(err)
+	}
+	return err
 }
 
 // classifyKeyword marks OpenSearch failures that retrying cannot fix as

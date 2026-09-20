@@ -35,6 +35,16 @@ type Event struct {
 	Version    int64     `json:"version"`
 }
 
+// LogAttrs returns the key/value pairs describing this event for structured
+// logging, so the pipeline can log it without knowing its shape.
+func (e Event) LogAttrs() []any {
+	return []any{
+		"event_id", e.EventID,
+		"document_id", e.DocumentID,
+		"operation", string(e.Operation),
+	}
+}
+
 // DecodeEvent parses and validates a message value. Any failure wraps
 // ErrMalformedEvent.
 func DecodeEvent(data []byte) (Event, error) {
