@@ -85,10 +85,19 @@ func run(logger *slog.Logger) error {
 	}
 	logger.Info("connected to qdrant", "collection", cfg.Qdrant.Collection, "vector_size", cfg.Qdrant.VectorSize)
 
-	embedder, err := embedding.NewClient(cfg.Gemini)
+	embedder, err := embedding.New(initCtx, cfg.Embedding)
 	if err != nil {
-		return fmt.Errorf("init embedding client: %w", err)
+		return fmt.Errorf("init embedding provider: %w", err)
 	}
+	// Qdrant rejects vectors of any other length, so a mismatch has to stop
+	// startup here rather than fail every message once consumption begins.
+	if embedder.Dimension() != cfg.Qdrant.VectorSize {
+		return fmt.Errorf("init embedding provider: %s produces %d-dimensional vectors but QDRANT_VECTOR_SIZE is %d",
+			embedder.Name(), embedder.Dimension(), cfg.Qdrant.VectorSize)
+	}
+	logger.Info("embedding provider ready",
+		"provider", embedder.Name(), "model", cfg.Embedding.Model,
+		"dimension", embedder.Dimension(), "timeout", cfg.Embedding.Timeout)
 
 	consumer, err := kafka.NewConsumer(initCtx, cfg.Kafka, logger)
 	if err != nil {

@@ -171,10 +171,12 @@ func TestBuildEmbeddingText(t *testing.T) {
 		doc  opensearch.Document
 		want string
 	}{
-		{"title and content", opensearch.Document{Title: "Go", Content: "A language."}, "Go\nA language."},
-		{"content only", opensearch.Document{Content: "A language."}, "A language."},
-		{"title only", opensearch.Document{Title: "Go"}, "Go"},
-		{"surrounding whitespace is dropped", opensearch.Document{Title: "  Go \n", Content: "\tA language.  "}, "Go\nA language."},
+		{"title and content", opensearch.Document{Title: "Go", Content: "A language."}, "title: Go | text: A language."},
+		// The Gemini format names a missing title rather than leaving it out.
+		{"content only", opensearch.Document{Content: "A language."}, "title: none | text: A language."},
+		{"title only", opensearch.Document{Title: "Go"}, "title: Go | text: "},
+		{"surrounding whitespace is dropped", opensearch.Document{Title: "  Go \n", Content: "\tA language.  "}, "title: Go | text: A language."},
+		{"line breaks inside the content are kept", opensearch.Document{Title: "Go", Content: "One.\nTwo."}, "title: Go | text: One.\nTwo."},
 		{"whitespace only", opensearch.Document{Title: "   ", Content: "\n\t"}, ""},
 		{"nothing to embed", opensearch.Document{}, ""},
 	}

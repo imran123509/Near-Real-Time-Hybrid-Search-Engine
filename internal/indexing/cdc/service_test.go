@@ -195,7 +195,7 @@ func TestServiceProcessCreate(t *testing.T) {
 	}
 
 	// The embedder saw exactly what BuildEmbeddingText produced.
-	want := []string{"Indexing\nChange events keep indexes current."}
+	want := []string{"title: Indexing | text: Change events keep indexes current."}
 	if got := s.embedder.calls(); len(got) != 1 || got[0] != want[0] {
 		t.Errorf("embedded texts = %q, want %q", got, want)
 	}
@@ -234,7 +234,7 @@ func TestServiceProcessUpdateReusesTheDocumentID(t *testing.T) {
 	}
 
 	// The new text was embedded again, because the content changed.
-	if got := s.embedder.calls(); len(got) != 2 || got[1] != "Second\nSecond body." {
+	if got := s.embedder.calls(); len(got) != 2 || got[1] != "title: Second | text: Second body." {
 		t.Errorf("embedded texts = %q, want the updated text second", got)
 	}
 }
@@ -459,7 +459,9 @@ func TestServiceProcessReportsVectorFailure(t *testing.T) {
 	}
 }
 
-// The embedder runs first so that its failure leaves both stores as they were.
+// Keyword indexing runs before the embedder, so that keyword search stays
+// current while the embedding provider is down. The failure must still be
+// reported, because the vector index is behind until the event is retried.
 func TestServiceProcessReportsEmbedderFailure(t *testing.T) {
 	s := newTestService(t)
 	want := errors.New("embedding api rate limited")
@@ -474,9 +476,23 @@ func TestServiceProcessReportsEmbedderFailure(t *testing.T) {
 	if !errors.As(err, &storeErr) || storeErr.Store != StoreEmbedder {
 		t.Fatalf("err = %v, want a StoreError naming %q", err, StoreEmbedder)
 	}
-	if s.keyword.indexCalls != 0 || s.vectors.upsertCalls != 0 {
-		t.Errorf("stores were written despite the embedder failing: %d index calls, %d upsert calls",
-			s.keyword.indexCalls, s.vectors.upsertCalls)
+	if _, ok := s.keyword.document(testDocumentID); !ok {
+		t.Error("the keyword index was not written before the embedder was called")
+	}
+	if s.vectors.upsertCalls != 0 {
+		t.Errorf("vector upsert calls = %d, want 0: there is no vector to store", s.vectors.upsertCalls)
+	}
+
+	// Once the provider recovers, re-processing the same event converges both
+	// stores on one document and one point.
+	s.embedder.mu.Lock()
+	s.embedder.err = nil
+	s.embedder.mu.Unlock()
+	if err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1)))); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if s.keyword.count() != 1 || s.vectors.count() != 1 {
+		t.Fatalf("after the retry: %d documents, %d points; want 1 and 1", s.keyword.count(), s.vectors.count())
 	}
 }
 
@@ -617,7 +633,7 @@ func TestEmbedderFuncAdaptsAFunction(t *testing.T) {
 	if err := service.Process(context.Background(), ev); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if got != "Title\nBody." {
-		t.Fatalf("embedded text = %q, want %q", got, "Title\nBody.")
+	if want := "title: Title | text: Body."; got != want {
+		t.Fatalf("embedded text = %q, want %q", got, want)
 	}
 }

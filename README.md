@@ -13,7 +13,7 @@ Results from both engines are merged with Reciprocal Rank Fusion (RRF).
 - `internal/postgres` – PostgreSQL repository
 - `internal/indexing` – indexing workers and pipeline
 - `internal/indexing/cdc` – Debezium change events, normalized and applied to both indexes
-- `internal/embedding` – embedding service client
+- `internal/embedding` – embedding provider interface and the Gemini implementation
 - `internal/config` – configuration loading
 - `migrations/` – database migrations
 - `benchmarks/` – benchmark code and results

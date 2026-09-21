@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"near-real-time-hybrid-search-engine/internal/embedding"
+	"near-real-time-hybrid-search-engine/internal/indexing/cdc"
 	"near-real-time-hybrid-search-engine/internal/postgres"
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
 	"near-real-time-hybrid-search-engine/internal/search/qdrant"
@@ -23,18 +24,26 @@ import (
 //     the previous point instead of adding a duplicate.
 //   - A document missing from PostgreSQL is deleted from both stores, and
 //     deleting something already gone succeeds.
+//
+// Embeddings come from any cdc.Embedder, which every embedding.Provider
+// satisfies, so the indexer neither knows nor cares which provider is behind
+// it. What text is embedded is decided by cdc.BuildEmbeddingText, the same rule
+// the change-data-capture path uses.
 type Indexer struct {
 	documents *postgres.Repository
-	embedder  *embedding.Client
+	embedder  cdc.Embedder
 	keyword   *opensearch.Client
 	vectors   *qdrant.Client
 }
 
-// NewIndexer returns an Indexer that writes keyword data through keyword and
-// vectors through vectors.
+// Every embedding provider can be handed to the indexers as it is.
+var _ cdc.Embedder = embedding.Provider(nil)
+
+// NewIndexer returns an Indexer that writes keyword data through keyword,
+// embeds through embedder and writes vectors through vectors.
 func NewIndexer(
 	documents *postgres.Repository,
-	embedder *embedding.Client,
+	embedder cdc.Embedder,
 	keyword *opensearch.Client,
 	vectors *qdrant.Client,
 ) *Indexer {
@@ -48,8 +57,14 @@ func NewIndexer(
 
 // Index brings both stores in line with the document named by ev.
 // Errors that retrying cannot fix are marked permanent.
+//
+// The order is OpenSearch, then the embedding, then Qdrant, and the first
+// failure stops it, for the reasons given on cdc.Service: keyword search stays
+// current even while the embedding provider is slow or down, and the only
+// partial state is the keyword index being ahead of the vector index until
+// the event is retried.
 func (ix *Indexer) Index(ctx context.Context, ev Event) error {
-	doc, err := ix.documents.GetDocument(ctx, ev.DocumentID)
+	row, err := ix.documents.GetDocument(ctx, ev.DocumentID)
 	if errors.Is(err, postgres.ErrNotFound) {
 		return ix.delete(ctx, ev.DocumentID)
 	}
@@ -57,21 +72,25 @@ func (ix *Indexer) Index(ctx context.Context, ev Event) error {
 		return fmt.Errorf("load document: %w", err)
 	}
 
-	// Embed first so a Gemini failure leaves both stores untouched.
-	vector, err := ix.embedder.EmbedDocument(ctx, doc.Title, doc.Body)
-	if err != nil {
-		return fmt.Errorf("embed document: %w", classifyEmbedding(err))
+	doc := opensearch.Document{
+		ID:        row.ID,
+		Title:     row.Title,
+		Content:   row.Body,
+		UpdatedAt: row.UpdatedAt,
+		Version:   row.Version,
+	}
+	text := cdc.BuildEmbeddingText(doc)
+	if text == "" {
+		return permanent(fmt.Errorf("document %s: %w", doc.ID, embedding.ErrEmptyText))
 	}
 
-	err = ix.keyword.IndexDocument(ctx, opensearch.Document{
-		ID:        doc.ID,
-		Title:     doc.Title,
-		Content:   doc.Body,
-		UpdatedAt: doc.UpdatedAt,
-		Version:   doc.Version,
-	})
-	if err != nil {
+	if err := ix.keyword.IndexDocument(ctx, doc); err != nil {
 		return fmt.Errorf("index in opensearch: %w", classifyKeyword(err))
+	}
+
+	vector, err := ix.embedder.Embed(ctx, text)
+	if err != nil {
+		return fmt.Errorf("embed document: %w", classifyEmbedding(err))
 	}
 
 	err = ix.vectors.Upsert(ctx, qdrant.Point{
@@ -107,9 +126,15 @@ func (ix *Indexer) EnsureStores(ctx context.Context) error {
 	return nil
 }
 
-// classifyEmbedding marks an embedding API response that retrying cannot fix
-// as permanent. Rate limits, timeouts and 5xx stay retryable.
+// classifyEmbedding marks embedding failures that retrying cannot fix as
+// permanent: text the provider will never accept, a vector of the wrong
+// dimension, which means the model and the configuration disagree, and a
+// request the provider refused outright. Rate limits, timeouts, 5xx and
+// transport failures stay retryable.
 func classifyEmbedding(err error) error {
+	if errors.Is(err, embedding.ErrEmptyText) || errors.Is(err, embedding.ErrDimensionMismatch) {
+		return permanent(err)
+	}
 	var apiErr *embedding.APIError
 	if errors.As(err, &apiErr) && !apiErr.Temporary() {
 		return permanent(err)

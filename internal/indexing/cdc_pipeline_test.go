@@ -102,7 +102,14 @@ func (s *stores) failUpserts(n int, err error) {
 // tests do not spend real time sleeping between retries.
 func newCDCTestPipeline(t *testing.T, st *stores, dlq DeadLetterPublisher, maxAttempts int) *Pipeline[cdc.ChangeEvent] {
 	t.Helper()
-	service, err := cdc.NewService(st, st, cdc.EmbedderFunc(st.Embed), cdc.DefaultMapping())
+	return newCDCTestPipelineWith(t, st, cdc.EmbedderFunc(st.Embed), dlq, maxAttempts)
+}
+
+// newCDCTestPipelineWith is newCDCTestPipeline with the embedder chosen by the
+// test.
+func newCDCTestPipelineWith(t *testing.T, st *stores, embedder cdc.Embedder, dlq DeadLetterPublisher, maxAttempts int) *Pipeline[cdc.ChangeEvent] {
+	t.Helper()
+	service, err := cdc.NewService(st, st, embedder, cdc.DefaultMapping())
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}

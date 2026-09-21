@@ -29,7 +29,7 @@ var optionalVars = []string{
 	"OPENSEARCH_USERNAME", "OPENSEARCH_PASSWORD", "OPENSEARCH_INDEX",
 	"QDRANT_API_KEY", "QDRANT_COLLECTION", "QDRANT_VECTOR_SIZE",
 	"INDEXING_WORKERS", "INDEXING_QUEUE_SIZE", "INDEXING_BATCH_SIZE", "INDEXING_RETRY_ATTEMPTS",
-	"GEMINI_API_KEY", "GEMINI_EMBEDDING_MODEL", "GEMINI_EMBEDDING_DIMENSIONS",
+	"EMBEDDING_PROVIDER", "EMBEDDING_API_KEY", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION", "EMBEDDING_TIMEOUT",
 }
 
 // setEnv gives every variable a known value: the required ones get valid
@@ -85,8 +85,11 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		{"Indexing.QueueSize", cfg.Indexing.QueueSize, 1000},
 		{"Indexing.BatchSize", cfg.Indexing.BatchSize, 100},
 		{"Indexing.RetryAttempts", cfg.Indexing.RetryAttempts, 3},
-		{"Gemini.Model", cfg.Gemini.Model, "gemini-embedding-2"},
-		{"Gemini.Dimensions", cfg.Gemini.Dimensions, 768},
+		{"Embedding.Provider", cfg.Embedding.Provider, "gemini"},
+		{"Embedding.APIKey", cfg.Embedding.APIKey, ""},
+		{"Embedding.Model", cfg.Embedding.Model, "gemini-embedding-2"},
+		{"Embedding.Dimension", cfg.Embedding.Dimension, 768},
+		{"Embedding.Timeout", cfg.Embedding.Timeout, 10 * time.Second},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -97,35 +100,37 @@ func TestLoadAppliesDefaults(t *testing.T) {
 
 func TestLoadSuccess(t *testing.T) {
 	setEnv(t, map[string]string{
-		"APP_ENV":                     "production",
-		"APP_NAME":                    "search",
-		"HTTP_HOST":                   "127.0.0.1",
-		"HTTP_PORT":                   "9090",
-		"HTTP_READ_TIMEOUT":           "5s",
-		"HTTP_WRITE_TIMEOUT":          "15s",
-		"HTTP_IDLE_TIMEOUT":           "1m30s",
-		"HTTP_SHUTDOWN_TIMEOUT":       "20s",
-		"KAFKA_DLQ_TOPIC":             "document-events.failed",
-		"KAFKA_WORKERS":               "6",
-		"OPENSEARCH_URL":              "https://opensearch.internal:9200",
-		"OPENSEARCH_USERNAME":         "search",
-		"OPENSEARCH_PASSWORD":         "not-a-real-password",
-		"OPENSEARCH_INDEX":            "docs-v2",
-		"QDRANT_URL":                  "https://qdrant.internal:6334",
-		"QDRANT_API_KEY":              "not-a-real-key",
-		"QDRANT_COLLECTION":           "docs-v2",
-		"DATABASE_MAX_CONNS":          "40",
-		"DATABASE_MIN_CONNS":          "5",
-		"DATABASE_MAX_CONN_LIFETIME":  "2h",
-		"DATABASE_CONNECT_TIMEOUT":    "3s",
-		"INDEXING_WORKERS":            "4",
-		"INDEXING_QUEUE_SIZE":         "200",
-		"INDEXING_BATCH_SIZE":         "50",
-		"INDEXING_RETRY_ATTEMPTS":     "5",
-		"GEMINI_API_KEY":              "not-a-real-key",
-		"GEMINI_EMBEDDING_MODEL":      "gemini-embedding-001",
-		"GEMINI_EMBEDDING_DIMENSIONS": "1536",
-		"QDRANT_VECTOR_SIZE":          "1536",
+		"APP_ENV":                    "production",
+		"APP_NAME":                   "search",
+		"HTTP_HOST":                  "127.0.0.1",
+		"HTTP_PORT":                  "9090",
+		"HTTP_READ_TIMEOUT":          "5s",
+		"HTTP_WRITE_TIMEOUT":         "15s",
+		"HTTP_IDLE_TIMEOUT":          "1m30s",
+		"HTTP_SHUTDOWN_TIMEOUT":      "20s",
+		"KAFKA_DLQ_TOPIC":            "document-events.failed",
+		"KAFKA_WORKERS":              "6",
+		"OPENSEARCH_URL":             "https://opensearch.internal:9200",
+		"OPENSEARCH_USERNAME":        "search",
+		"OPENSEARCH_PASSWORD":        "not-a-real-password",
+		"OPENSEARCH_INDEX":           "docs-v2",
+		"QDRANT_URL":                 "https://qdrant.internal:6334",
+		"QDRANT_API_KEY":             "not-a-real-key",
+		"QDRANT_COLLECTION":          "docs-v2",
+		"DATABASE_MAX_CONNS":         "40",
+		"DATABASE_MIN_CONNS":         "5",
+		"DATABASE_MAX_CONN_LIFETIME": "2h",
+		"DATABASE_CONNECT_TIMEOUT":   "3s",
+		"INDEXING_WORKERS":           "4",
+		"INDEXING_QUEUE_SIZE":        "200",
+		"INDEXING_BATCH_SIZE":        "50",
+		"INDEXING_RETRY_ATTEMPTS":    "5",
+		"EMBEDDING_PROVIDER":         " Gemini ",
+		"EMBEDDING_API_KEY":          "not-a-real-key",
+		"EMBEDDING_MODEL":            "gemini-embedding-001",
+		"EMBEDDING_DIMENSION":        "1536",
+		"EMBEDDING_TIMEOUT":          "3s",
+		"QDRANT_VECTOR_SIZE":         "1536",
 	})
 
 	cfg, err := Load()
@@ -157,8 +162,15 @@ func TestLoadSuccess(t *testing.T) {
 	if cfg.Indexing != want {
 		t.Errorf("Indexing = %+v, want %+v", cfg.Indexing, want)
 	}
-	if cfg.Gemini.Model != "gemini-embedding-001" || cfg.Gemini.Dimensions != 1536 {
-		t.Errorf("Gemini = %+v", cfg.Gemini)
+	wantEmbedding := EmbeddingConfig{
+		Provider:  "gemini", // trimmed and lowercased
+		APIKey:    "not-a-real-key",
+		Model:     "gemini-embedding-001",
+		Dimension: 1536,
+		Timeout:   3 * time.Second,
+	}
+	if cfg.Embedding != wantEmbedding {
+		t.Errorf("Embedding = %+v, want %+v", cfg.Embedding, wantEmbedding)
 	}
 }
 
@@ -196,7 +208,11 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"zero db connect timeout", "DATABASE_CONNECT_TIMEOUT", "0s", "DATABASE_CONNECT_TIMEOUT must be positive"},
 		{"invalid vector size", "QDRANT_VECTOR_SIZE", "big", "invalid QDRANT_VECTOR_SIZE"},
 		{"zero vector size", "QDRANT_VECTOR_SIZE", "0", "QDRANT_VECTOR_SIZE must be positive"},
-		{"vector size differs from embedding model", "QDRANT_VECTOR_SIZE", "384", "must match GEMINI_EMBEDDING_DIMENSIONS"},
+		{"vector size differs from embedding model", "QDRANT_VECTOR_SIZE", "384", "must match EMBEDDING_DIMENSION"},
+		{"invalid embedding dimension", "EMBEDDING_DIMENSION", "wide", "invalid EMBEDDING_DIMENSION"},
+		{"zero embedding dimension", "EMBEDDING_DIMENSION", "0", "EMBEDDING_DIMENSION must be positive"},
+		{"invalid embedding timeout", "EMBEDDING_TIMEOUT", "10", "invalid EMBEDDING_TIMEOUT"},
+		{"zero embedding timeout", "EMBEDDING_TIMEOUT", "0s", "EMBEDDING_TIMEOUT must be positive"},
 		{"db min conns may be zero", "DATABASE_MIN_CONNS", "0", ""},
 		{"zero queue size", "INDEXING_QUEUE_SIZE", "0", "INDEXING_QUEUE_SIZE must be positive"},
 		{"zero retry attempts", "INDEXING_RETRY_ATTEMPTS", "0", "INDEXING_RETRY_ATTEMPTS must be positive"},
@@ -291,13 +307,27 @@ func TestQdrantURLWithoutPortUsesGRPCDefault(t *testing.T) {
 }
 
 func TestQdrantVectorSizeFollowsEmbeddingModel(t *testing.T) {
-	setEnv(t, map[string]string{"GEMINI_EMBEDDING_DIMENSIONS": "1024"})
+	setEnv(t, map[string]string{"EMBEDDING_DIMENSION": "1024"})
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.Qdrant.VectorSize != 1024 {
-		t.Errorf("Qdrant.VectorSize = %d, want 1024 from GEMINI_EMBEDDING_DIMENSIONS", cfg.Qdrant.VectorSize)
+		t.Errorf("Qdrant.VectorSize = %d, want 1024 from EMBEDDING_DIMENSION", cfg.Qdrant.VectorSize)
+	}
+}
+
+// The API process never embeds, so a missing key must not stop it loading.
+// The embedding provider rejects an empty key when the consumer creates it.
+func TestLoadDoesNotRequireEmbeddingAPIKey(t *testing.T) {
+	setEnv(t, map[string]string{"EMBEDDING_API_KEY": ""})
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Embedding.APIKey != "" {
+		t.Errorf("Embedding.APIKey = %q, want empty", cfg.Embedding.APIKey)
 	}
 }

@@ -85,30 +85,39 @@ func (m FieldMapping) VectorPayload(doc opensearch.Document) map[string]any {
 }
 
 // BuildEmbeddingText returns the text that represents doc to an embedding
-// model: the title and the content, separated by a newline, with either part
-// dropped when it is empty.
+// model, in the form the Gemini documentation recommends for a document that
+// search queries will be compared against:
+//
+//	title: {title} | text: {content}
+//
+// with "none" standing in for a missing title. gemini-embedding-2 has no
+// task_type parameter; this prefix is how it tells a retrievable document from
+// a query. A query must be embedded in the matching form,
+// "task: search result | query: {query}", or the two will not line up.
+// Providers that do not need the prefix read it as ordinary text.
+//
+// It returns "" when the document has neither title nor content, since there
+// is nothing to embed.
 //
 // It is deliberately a plain function of the document and nothing else. The
 // same document always produces the same text, so re-processing an event
-// produces the same vector, and the rule can be changed and reasoned about
-// without touching any embedding provider. It is the only place that decides
-// what gets embedded:
+// produces the same vector, and the rule lives here rather than in a provider,
+// which only turns text into a vector:
 //
 //	opensearch.Document -> BuildEmbeddingText -> Embedder -> []float32 -> Qdrant
 //
 // Changing this rule changes every future vector, so existing documents have
-// to be reindexed for old and new vectors to stay comparable.
+// to be re-embedded for old and new vectors to stay comparable.
 func BuildEmbeddingText(doc opensearch.Document) string {
 	title := strings.TrimSpace(doc.Title)
 	content := strings.TrimSpace(doc.Content)
-	switch {
-	case title == "":
-		return content
-	case content == "":
-		return title
-	default:
-		return title + "\n" + content
+	if title == "" && content == "" {
+		return ""
 	}
+	if title == "" {
+		title = "none"
+	}
+	return "title: " + title + " | text: " + content
 }
 
 // text reads a string column. A missing column or a SQL NULL is an empty

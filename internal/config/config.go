@@ -17,7 +17,7 @@ import (
 // Config is the full set of settings for both services. Each service reads
 // only the groups it needs: the API uses App, Server, PostgreSQL, OpenSearch
 // and Qdrant; the consumer uses App, Kafka, Indexing, PostgreSQL, OpenSearch,
-// Qdrant and Gemini.
+// Qdrant and Embedding.
 type Config struct {
 	App        AppConfig
 	Server     ServerConfig
@@ -26,7 +26,7 @@ type Config struct {
 	OpenSearch OpenSearchConfig
 	Qdrant     QdrantConfig
 	Indexing   IndexingConfig
-	Gemini     GeminiConfig
+	Embedding  EmbeddingConfig
 }
 
 // AppConfig identifies the running service.
@@ -94,8 +94,8 @@ type QdrantConfig struct {
 	APIKey     string // QDRANT_API_KEY
 	Collection string // QDRANT_COLLECTION
 	// VectorSize is the dimension of every stored vector. It must equal the
-	// embedding model's output size, so it defaults to
-	// GEMINI_EMBEDDING_DIMENSIONS and Load rejects a mismatch.
+	// embedding model's output size, so it defaults to EMBEDDING_DIMENSION
+	// and Load rejects a mismatch.
 	VectorSize int // QDRANT_VECTOR_SIZE
 
 	Host   string
@@ -113,12 +113,24 @@ type IndexingConfig struct {
 	RetryAttempts int // INDEXING_RETRY_ATTEMPTS
 }
 
-// GeminiConfig holds embedding API settings for the consumer. APIKey is a
-// secret, so never log it.
-type GeminiConfig struct {
-	APIKey     string // GEMINI_API_KEY
-	Model      string // GEMINI_EMBEDDING_MODEL
-	Dimensions int    // GEMINI_EMBEDDING_DIMENSIONS
+// EmbeddingConfig selects and configures the provider that turns text into
+// vectors. It is provider-neutral: switching providers means changing these
+// values, not adding a new group. APIKey is a secret, so never log it.
+type EmbeddingConfig struct {
+	// Provider names the implementation to use, such as "gemini". It is
+	// trimmed and lowercased; the embedding package rejects unknown names.
+	Provider string // EMBEDDING_PROVIDER
+	APIKey   string // EMBEDDING_API_KEY
+	Model    string // EMBEDDING_MODEL
+	// Dimension is the length of every vector. The provider is asked for
+	// exactly this many values and rejects a response of any other length,
+	// so that a wrong-sized vector never reaches Qdrant. Changing the model
+	// may change it, and then every stored vector has to be re-embedded.
+	Dimension int // EMBEDDING_DIMENSION
+	// Timeout bounds a single embedding request, network round trip
+	// included. It is applied inside the caller's context, so a shorter
+	// caller deadline or a cancellation still wins.
+	Timeout time.Duration // EMBEDDING_TIMEOUT
 }
 
 // Load reads the environment, applies defaults, parses values and validates
@@ -126,8 +138,8 @@ type GeminiConfig struct {
 // never logs secrets.
 //
 // Required: DATABASE_URL, KAFKA_BROKERS, KAFKA_TOPIC, KAFKA_CONSUMER_GROUP,
-// OPENSEARCH_URL, QDRANT_URL. The consumer additionally needs GEMINI_API_KEY,
-// which its embedding client checks.
+// OPENSEARCH_URL, QDRANT_URL. The consumer additionally needs
+// EMBEDDING_API_KEY, which the embedding provider checks when it is created.
 func Load() (Config, error) {
 	var e env
 
@@ -176,14 +188,16 @@ func Load() (Config, error) {
 			BatchSize:     e.int("INDEXING_BATCH_SIZE", 100),
 			RetryAttempts: e.int("INDEXING_RETRY_ATTEMPTS", 3),
 		},
-		Gemini: GeminiConfig{
-			APIKey:     os.Getenv("GEMINI_API_KEY"),
-			Model:      getEnv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2"),
-			Dimensions: e.int("GEMINI_EMBEDDING_DIMENSIONS", 768),
+		Embedding: EmbeddingConfig{
+			Provider:  strings.ToLower(getEnv("EMBEDDING_PROVIDER", "gemini")),
+			APIKey:    strings.TrimSpace(os.Getenv("EMBEDDING_API_KEY")),
+			Model:     getEnv("EMBEDDING_MODEL", "gemini-embedding-2"),
+			Dimension: e.int("EMBEDDING_DIMENSION", 768),
+			Timeout:   e.duration("EMBEDDING_TIMEOUT", 10*time.Second),
 		},
 	}
 	cfg.Kafka.DLQTopic = getEnv("KAFKA_DLQ_TOPIC", cfg.Kafka.Topic+".dlq")
-	cfg.Qdrant.VectorSize = e.int("QDRANT_VECTOR_SIZE", cfg.Gemini.Dimensions)
+	cfg.Qdrant.VectorSize = e.int("QDRANT_VECTOR_SIZE", cfg.Embedding.Dimension)
 
 	if err := e.err(); err != nil {
 		return Config{}, err
@@ -225,6 +239,7 @@ func (c Config) validate() error {
 		{"DATABASE_MAX_CONN_IDLE_TIME", c.PostgreSQL.MaxConnIdleTime},
 		{"DATABASE_HEALTH_CHECK_PERIOD", c.PostgreSQL.HealthCheckPeriod},
 		{"DATABASE_CONNECT_TIMEOUT", c.PostgreSQL.ConnectTimeout},
+		{"EMBEDDING_TIMEOUT", c.Embedding.Timeout},
 	} {
 		if d.value <= 0 {
 			add(fmt.Errorf("%s must be positive, got %s", d.key, d.value))
@@ -240,7 +255,7 @@ func (c Config) validate() error {
 		{"INDEXING_QUEUE_SIZE", c.Indexing.QueueSize},
 		{"INDEXING_BATCH_SIZE", c.Indexing.BatchSize},
 		{"INDEXING_RETRY_ATTEMPTS", c.Indexing.RetryAttempts},
-		{"GEMINI_EMBEDDING_DIMENSIONS", c.Gemini.Dimensions},
+		{"EMBEDDING_DIMENSION", c.Embedding.Dimension},
 		{"QDRANT_VECTOR_SIZE", c.Qdrant.VectorSize},
 	} {
 		if n.value <= 0 {
@@ -262,12 +277,12 @@ func (c Config) validate() error {
 		add(errors.New("QDRANT_COLLECTION must not be empty"))
 	}
 	// Qdrant rejects every vector whose length differs from the collection's.
-	if c.Qdrant.VectorSize != c.Gemini.Dimensions {
-		add(fmt.Errorf("QDRANT_VECTOR_SIZE (%d) must match GEMINI_EMBEDDING_DIMENSIONS (%d)",
-			c.Qdrant.VectorSize, c.Gemini.Dimensions))
+	if c.Qdrant.VectorSize != c.Embedding.Dimension {
+		add(fmt.Errorf("QDRANT_VECTOR_SIZE (%d) must match EMBEDDING_DIMENSION (%d)",
+			c.Qdrant.VectorSize, c.Embedding.Dimension))
 	}
-	if c.Gemini.Model == "" {
-		add(errors.New("GEMINI_EMBEDDING_MODEL must not be empty"))
+	if c.Embedding.Model == "" {
+		add(errors.New("EMBEDDING_MODEL must not be empty"))
 	}
 
 	return errors.Join(errs...)

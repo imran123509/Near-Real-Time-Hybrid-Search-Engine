@@ -15,10 +15,11 @@ var ErrNoEmbeddingText = fmt.Errorf("%w: document has no text to embed", ErrMalf
 
 // Embedder turns text into a vector.
 //
-// The service depends on this interface rather than on any particular
-// provider, so the provider can be chosen, swapped or faked without the
-// service knowing. What text reaches it is decided by BuildEmbeddingText, not
-// by the provider.
+// It is the one method this package needs from an embedding provider, kept
+// here beside the code that uses it. Every embedding.Provider satisfies it, so
+// the provider can be chosen, swapped or faked without this package importing
+// any of them. What text reaches it is decided by BuildEmbeddingText, not by
+// the provider.
 type Embedder interface {
 	Embed(ctx context.Context, text string) ([]float32, error)
 }
@@ -78,12 +79,18 @@ type VectorIndex interface {
 // swallowed, and re-processing it converges both stores, which is safe
 // precisely because the writes are idempotent.
 //
-// An upsert writes OpenSearch first and Qdrant second, and stops at the first
-// failure, so only one partial state is reachable: the keyword index holds the
-// new document while the vector index still holds the old one, until the event
-// succeeds on a later attempt. Until then the document is findable by keyword
-// but ranks on a stale vector. A failure before OpenSearch, in the embedder or
-// the mapping, leaves both stores untouched.
+// An upsert runs in this order and stops at the first failure:
+//
+//	map the row -> OpenSearch -> embed -> Qdrant
+//
+// Keyword indexing comes first so that the document is searchable by keyword
+// as soon as possible and does not wait on the embedding provider, the
+// slowest and least reliable step. The cost is that only one partial state is
+// reachable, whichever later step fails: the keyword index holds the new
+// document while the vector index still holds the old vector, or none. Until
+// the event succeeds on a later attempt, the document is findable by keyword
+// but ranks on a stale vector. A row that cannot be mapped, or has no text,
+// leaves both stores untouched.
 //
 // A delete is the other way round: both stores are asked to delete even if the
 // first one fails, and the failures are reported together. Leaving a document
@@ -133,6 +140,11 @@ func (s *Service) Process(ctx context.Context, ev ChangeEvent) error {
 	if err := ev.Validate(); err != nil {
 		return err
 	}
+	// Starting writes that cannot finish would only widen the gap between
+	// the two stores.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if ev.Operation == OperationDelete {
 		return s.delete(ctx, ev.ID)
 	}
@@ -146,20 +158,23 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) error {
 		return err
 	}
 
+	// Checked before any write: a document with no text is not worth
+	// keyword-indexing either.
 	text := BuildEmbeddingText(doc)
 	if text == "" {
 		return fmt.Errorf("%w: %s", ErrNoEmbeddingText, ev.ID)
 	}
 
-	// Embed before writing anything, so that an embedder failure leaves both
-	// stores as they were instead of updating one of them.
+	if err := s.keyword.IndexDocument(ctx, doc); err != nil {
+		return storeErr(StoreKeyword, ev.ID, err)
+	}
+
+	// From here on OpenSearch already holds the new document, so any failure
+	// leaves the vector index behind until this event is processed again,
+	// which is safe because every write is idempotent.
 	vector, err := s.embedder.Embed(ctx, text)
 	if err != nil {
 		return storeErr(StoreEmbedder, ev.ID, err)
-	}
-
-	if err := s.keyword.IndexDocument(ctx, doc); err != nil {
-		return storeErr(StoreKeyword, ev.ID, err)
 	}
 
 	err = s.vectors.Upsert(ctx, qdrant.Point{
@@ -168,9 +183,6 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) error {
 		Payload: s.mapping.VectorPayload(doc),
 	})
 	if err != nil {
-		// OpenSearch already holds the new document. The stores stay out of
-		// step until this event is processed again, which is safe because
-		// both writes are idempotent.
 		return storeErr(StoreVector, ev.ID, err)
 	}
 	return nil
