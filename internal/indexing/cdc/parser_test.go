@@ -16,14 +16,20 @@ const (
 // debeziumEvent builds a change event in the shape Debezium emits for the
 // documents table with value.converter.schemas.enable=false.
 func debeziumEvent(op, before, after string) string {
+	return debeziumEventAt(op, before, after, 24023128)
+}
+
+// debeziumEventAt is debeziumEvent for a change at a chosen position in the
+// write-ahead log, which is what tells two otherwise identical events apart.
+func debeziumEventAt(op, before, after string, lsn int64) string {
 	return `{
 	  "before": ` + before + `,
 	  "after": ` + after + `,
 	  "source": {
 	    "version": "2.5.0.Final", "connector": "postgresql", "name": "pg",
 	    "ts_ms": 1714557600000, "snapshot": "false", "db": "searchdb",
-	    "sequence": "[null,\"24023128\"]", "schema": "public", "table": "documents",
-	    "txId": 755, "lsn": 24023128
+	    "sequence": "[null,\"` + itoa(int(lsn)) + `\"]", "schema": "public", "table": "documents",
+	    "txId": 755, "lsn": ` + itoa(int(lsn)) + `
 	  },
 	  "op": "` + op + `",
 	  "ts_ms": 1714557600987,
@@ -394,5 +400,159 @@ func TestChangeEventLogAttrsLeaveOutTheRow(t *testing.T) {
 		if s, ok := attr.(string); ok && strings.Contains(s, "secret") {
 			t.Fatalf("LogAttrs leaked document contents: %v", attrs)
 		}
+	}
+}
+
+// The connector reports where in the write-ahead log a change came from. That
+// metadata is what event identity and stale-event detection are built on, so
+// it has to survive parsing.
+func TestParseKeepsTheSourcePosition(t *testing.T) {
+	ev, err := ParseChangeEvent([]byte(debeziumEventAt("u", "null", documentRow(testDocumentID, "T", "B", 7), 24100912)))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if ev.LSN != 24100912 || ev.TxID != 755 || ev.Database != "searchdb" {
+		t.Errorf("source = lsn %d, txId %d, db %q; want 24100912, 755, searchdb", ev.LSN, ev.TxID, ev.Database)
+	}
+	if ev.Snapshot {
+		t.Error("a change read from the log was reported as a snapshot read")
+	}
+}
+
+// Debezium writes the snapshot marker as a string, but older versions wrote a
+// boolean. Neither may turn a usable event into a malformed one.
+func TestParseAcceptsBothSnapshotMarkers(t *testing.T) {
+	tests := []struct {
+		marker string
+		want   bool
+	}{
+		{`"true"`, true},
+		{`"first"`, true},
+		{`"last"`, true},
+		{`"false"`, false},
+		{`"incremental"`, false},
+		{`true`, true},
+		{`false`, false},
+		{`null`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.marker, func(t *testing.T) {
+			value := `{"before": null, "after": ` + documentRow(testDocumentID, "T", "B", 1) + `,
+			  "source": {"schema": "public", "table": "documents", "lsn": 24023128, "snapshot": ` + tt.marker + `},
+			  "op": "r", "ts_ms": 1714557600987}`
+
+			ev, err := ParseChangeEvent([]byte(value))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if ev.Snapshot != tt.want {
+				t.Errorf("Snapshot = %v, want %v", ev.Snapshot, tt.want)
+			}
+		})
+	}
+}
+
+// Event identity is what makes a redelivery recognisable, so the same change
+// must always produce the same ID, and different changes different ones.
+func TestEventIDIsDeterministic(t *testing.T) {
+	value := debeziumEventAt("u", "null", documentRow(testDocumentID, "T", "B", 7), 24100912)
+
+	first, err := ParseChangeEvent([]byte(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ParseChangeEvent([]byte(value))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if first.EventID() != second.EventID() {
+		t.Fatalf("the same message parsed twice produced %q and %q", first.EventID(), second.EventID())
+	}
+	want := "public.documents:" + testDocumentID + ":UPDATE@lsn:24100912"
+	if first.EventID() != want {
+		t.Errorf("EventID = %q, want %q", first.EventID(), want)
+	}
+	// The identity of an event is not the identity of its document: one
+	// document has many events.
+	if first.EventID() == first.ID {
+		t.Error("EventID and the document ID must not be the same value")
+	}
+}
+
+func TestEventIDSeparatesDifferentChanges(t *testing.T) {
+	base := ChangeEvent{
+		ID:        testDocumentID,
+		Operation: OperationUpdate,
+		Schema:    "public",
+		Table:     "documents",
+		LSN:       24100912,
+	}
+
+	tests := []struct {
+		name   string
+		change func(*ChangeEvent)
+	}{
+		{"another row", func(e *ChangeEvent) { e.ID = "other-document" }},
+		{"another operation", func(e *ChangeEvent) { e.Operation = OperationDelete }},
+		{"another log position", func(e *ChangeEvent) { e.LSN = 24100913 }},
+		{"another table", func(e *ChangeEvent) { e.Table = "articles" }},
+		{"another schema", func(e *ChangeEvent) { e.Schema = "archive" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			other := base
+			tt.change(&other)
+			if other.EventID() == base.EventID() {
+				t.Errorf("%s produced the same event id %q", tt.name, other.EventID())
+			}
+		})
+	}
+}
+
+// A connector that reports no log position still has to produce a stable
+// identity, so the commit time stands in and only then is it given up on.
+func TestEventIDFallsBackToTheCommitTime(t *testing.T) {
+	ev := ChangeEvent{
+		ID:        testDocumentID,
+		Operation: OperationCreate,
+		Schema:    "public",
+		Table:     "documents",
+		Timestamp: time.UnixMilli(commitMillis).UTC(),
+	}
+	want := "public.documents:" + testDocumentID + ":CREATE@ts:" + itoa(commitMillis)
+	if ev.EventID() != want {
+		t.Errorf("EventID = %q, want %q", ev.EventID(), want)
+	}
+
+	ev.Timestamp = time.Time{}
+	if got := ev.EventID(); !strings.HasSuffix(got, "@unknown") {
+		t.Errorf("EventID = %q, want it to admit the position is unknown", got)
+	}
+}
+
+// A replay has to be visible in the logs, which means the event identity has
+// to be in them, beside the document it belongs to.
+func TestChangeEventLogAttrsNameTheEvent(t *testing.T) {
+	ev, err := ParseChangeEvent([]byte(debeziumEventAt("u", "null", documentRow(testDocumentID, "T", "B", 7), 24100912)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attrs := ev.LogAttrs()
+	fields := map[string]any{}
+	for i := 0; i+1 < len(attrs); i += 2 {
+		key, _ := attrs[i].(string)
+		fields[key] = attrs[i+1]
+	}
+	if fields["event_id"] != ev.EventID() {
+		t.Errorf("event_id = %v, want %q", fields["event_id"], ev.EventID())
+	}
+	if fields["document_id"] != ev.ID {
+		t.Errorf("document_id = %v, want %q", fields["document_id"], ev.ID)
+	}
+	if fields["lsn"] != int64(24100912) {
+		t.Errorf("lsn = %v, want 24100912", fields["lsn"])
 	}
 }

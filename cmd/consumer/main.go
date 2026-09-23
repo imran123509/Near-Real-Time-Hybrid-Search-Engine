@@ -1,5 +1,9 @@
-// Command consumer reads document events from Kafka and indexes the documents
-// into OpenSearch and Qdrant.
+// Command consumer reads Debezium change events for the documents table from
+// Kafka and applies them to OpenSearch and Qdrant.
+//
+// Each event carries the changed row, so the consumer never reads PostgreSQL:
+//
+//	Kafka -> worker pool -> cdc parser -> cdc.Service -> OpenSearch, embedding -> Qdrant
 package main
 
 import (
@@ -15,27 +19,27 @@ import (
 	"near-real-time-hybrid-search-engine/internal/config"
 	"near-real-time-hybrid-search-engine/internal/embedding"
 	"near-real-time-hybrid-search-engine/internal/indexing"
+	"near-real-time-hybrid-search-engine/internal/indexing/cdc"
 	"near-real-time-hybrid-search-engine/internal/kafka"
-	"near-real-time-hybrid-search-engine/internal/postgres"
+	"near-real-time-hybrid-search-engine/internal/retry"
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
 	"near-real-time-hybrid-search-engine/internal/search/qdrant"
+	"near-real-time-hybrid-search-engine/internal/startup"
 )
 
-const (
-	startupTimeout  = 30 * time.Second
-	shutdownTimeout = 25 * time.Second
-)
+const shutdownTimeout = 25 * time.Second
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(logger); err != nil {
+	level := new(slog.LevelVar) // info until the configuration names a level
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	if err := run(logger, level); err != nil {
 		logger.Error("consumer stopped with error", "error", err)
 		os.Exit(1)
 	}
 	logger.Info("consumer stopped")
 }
 
-func run(logger *slog.Logger) error {
+func run(logger *slog.Logger, level *slog.LevelVar) error {
 	// rootCtx is the parent of all message processing. It is not cancelled by
 	// a shutdown signal, so in-flight messages can finish.
 	rootCtx, cancel := context.WithCancel(context.Background())
@@ -48,46 +52,50 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	level.Set(cfg.App.LogLevel)
 	logger.Info("starting consumer",
 		"app", cfg.App.Name, "env", cfg.App.Env,
 		"topic", cfg.Kafka.Topic, "group", cfg.Kafka.ConsumerGroup, "dlq_topic", cfg.Kafka.DLQTopic,
 		"workers", cfg.Indexing.Workers, "queue_size", cfg.Indexing.QueueSize,
-		"retry_attempts", cfg.Indexing.RetryAttempts)
+		"retry_max_attempts", cfg.Kafka.Retry.MaxAttempts,
+		"retry_initial_backoff", cfg.Kafka.Retry.InitialBackoff,
+		"retry_max_backoff", cfg.Kafka.Retry.MaxBackoff,
+		"retry_multiplier", cfg.Kafka.Retry.Multiplier,
+		"startup_timeout", cfg.App.StartupTimeout)
 
-	initCtx, cancelInit := context.WithTimeout(ctx, startupTimeout)
+	// Dependencies may still be starting; each is retried until this deadline.
+	initCtx, cancelInit := context.WithTimeout(ctx, cfg.App.StartupTimeout)
 	defer cancelInit()
-
-	db, err := postgres.New(initCtx, cfg.PostgreSQL)
-	if err != nil {
-		return fmt.Errorf("init postgres: %w", err)
-	}
-	defer closeWithLog(logger, "postgres", func() error { db.Close(); return nil })
-	logger.Info("connected to postgres",
-		"max_conns", cfg.PostgreSQL.MaxConns, "min_conns", cfg.PostgreSQL.MinConns)
 
 	osClient, err := opensearch.New(cfg.OpenSearch)
 	if err != nil {
 		return fmt.Errorf("init opensearch: %w", err)
 	}
 	defer closeWithLog(logger, "opensearch", osClient.Close)
-	if err := osClient.Ping(initCtx); err != nil {
+	if err := startup.Retry(initCtx, logger, "opensearch", osClient.EnsureIndex); err != nil {
 		return fmt.Errorf("init opensearch: %w", err)
 	}
-	logger.Info("connected to opensearch", "index", cfg.OpenSearch.Index)
+	logger.Info("opensearch ready", "index", cfg.OpenSearch.Index)
 
 	qdClient, err := qdrant.New(cfg.Qdrant)
 	if err != nil {
 		return fmt.Errorf("init qdrant: %w", err)
 	}
 	defer closeWithLog(logger, "qdrant", qdClient.Close)
-	if err := qdClient.Ping(initCtx); err != nil {
+	// EnsureCollection also rejects an existing collection whose vector size
+	// differs from QDRANT_VECTOR_SIZE.
+	if err := startup.Retry(initCtx, logger, "qdrant", qdClient.EnsureCollection); err != nil {
 		return fmt.Errorf("init qdrant: %w", err)
 	}
-	logger.Info("connected to qdrant", "collection", cfg.Qdrant.Collection, "vector_size", cfg.Qdrant.VectorSize)
+	logger.Info("qdrant ready", "collection", cfg.Qdrant.Collection, "vector_size", cfg.Qdrant.VectorSize)
 
 	embedder, err := embedding.New(initCtx, cfg.Embedding)
 	if err != nil {
 		return fmt.Errorf("init embedding provider: %w", err)
+	}
+	// The fake provider is for tests and local runs; its vectors mean nothing.
+	if cfg.App.Env == "production" && embedder.Name() == embedding.ProviderFake {
+		return fmt.Errorf("init embedding provider: the %q provider must not run in production", embedding.ProviderFake)
 	}
 	// Qdrant rejects vectors of any other length, so a mismatch has to stop
 	// startup here rather than fail every message once consumption begins.
@@ -99,7 +107,14 @@ func run(logger *slog.Logger) error {
 		"provider", embedder.Name(), "model", cfg.Embedding.Model,
 		"dimension", embedder.Dimension(), "timeout", cfg.Embedding.Timeout)
 
-	consumer, err := kafka.NewConsumer(initCtx, cfg.Kafka, logger)
+	// The topic is created by Debezium or, under Docker Compose, by the
+	// kafka-init job; until it exists, NewConsumer fails and is retried.
+	var consumer *kafka.Consumer
+	err = startup.Retry(initCtx, logger, "kafka", func(ctx context.Context) error {
+		var err error
+		consumer, err = kafka.NewConsumer(ctx, cfg.Kafka, logger)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("init kafka consumer: %w", err)
 	}
@@ -112,11 +127,14 @@ func run(logger *slog.Logger) error {
 	}
 	defer closeWithLog(logger, "kafka dead-letter writer", deadLetters.Close)
 
-	indexer := indexing.NewIndexer(postgres.NewRepository(db), embedder, osClient, qdClient)
-	if err := indexer.EnsureStores(initCtx); err != nil {
-		return fmt.Errorf("init search stores: %w", err)
+	changes, err := cdc.NewService(osClient, qdClient, embedder, cdc.DefaultMapping())
+	if err != nil {
+		return fmt.Errorf("init cdc service: %w", err)
 	}
-	pipeline := indexing.NewPipeline(indexing.DecodeEvent, indexer, deadLetters, cfg.Indexing.RetryAttempts, logger)
+	pipeline, err := indexing.NewCDCPipeline(changes, deadLetters, retryPolicy(cfg.Kafka.Retry), logger)
+	if err != nil {
+		return fmt.Errorf("init indexing pipeline: %w", err)
+	}
 
 	// consumeCtx stops fetching on a shutdown signal, or when a worker reports
 	// a failure that makes it unsafe to keep committing offsets.
@@ -153,9 +171,21 @@ func run(logger *slog.Logger) error {
 	logger.Info("workers stopped")
 
 	// Deferred closes now run in reverse order: dead-letter writer, Kafka
-	// consumer (flushing the final offset commits), Qdrant, OpenSearch, and
-	// PostgreSQL last.
+	// consumer (flushing the final offset commits), Qdrant, then OpenSearch.
 	return runErr
+}
+
+// retryPolicy turns the configured retry settings into the policy the
+// indexing pipeline applies. The two types are kept apart so that config
+// stays free of package dependencies and the retry package stays free of
+// environment variables.
+func retryPolicy(cfg config.RetryConfig) retry.Policy {
+	return retry.Policy{
+		MaxAttempts:    cfg.MaxAttempts,
+		InitialBackoff: cfg.InitialBackoff,
+		MaxBackoff:     cfg.MaxBackoff,
+		Multiplier:     cfg.Multiplier,
+	}
 }
 
 func closeWithLog(logger *slog.Logger, name string, closeFn func() error) {

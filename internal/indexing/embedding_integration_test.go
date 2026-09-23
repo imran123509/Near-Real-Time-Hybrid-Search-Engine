@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
 	"near-real-time-hybrid-search-engine/internal/embedding"
 	"near-real-time-hybrid-search-engine/internal/indexing/cdc"
+	"near-real-time-hybrid-search-engine/internal/retry"
 )
 
 // These tests check how the indexing pipeline uses an embedding provider: when
@@ -68,10 +70,10 @@ func TestEmbedderIsCalledOnlyForUpserts(t *testing.T) {
 		t.Run(tt.op, func(t *testing.T) {
 			st := newStores()
 			embedder := newFakeEmbedder()
-			dlq := &fakeDeadLetters{}
+			deadLetters := &fakeDeadLetters{}
 
 			msg := changeMessage(tt.op, cdcTestID, 1, 0)
-			if err := newCDCTestPipelineWith(t, st, embedder, dlq, 3).Process(context.Background(), msg); err != nil {
+			if err := newCDCTestPipelineWith(t, st, embedder, deadLetters, attemptsPolicy(3)).Process(context.Background(), msg); err != nil {
 				t.Fatalf("Process: %v", err)
 			}
 
@@ -89,8 +91,8 @@ func TestEmbedderIsCalledOnlyForUpserts(t *testing.T) {
 			if _, points := st.counts(); points != 1 {
 				t.Errorf("points = %d, want the vector stored", points)
 			}
-			if len(dlq.causes) != 0 {
-				t.Errorf("dead-lettered: %v", dlq.causes)
+			if deadLetters.count() != 0 {
+				t.Errorf("dead-lettered: %v", deadLetters.all())
 			}
 		})
 	}
@@ -103,18 +105,23 @@ func TestEmbeddingFailureIsReturnedAndRetried(t *testing.T) {
 	st := newStores()
 	embedder := newFakeEmbedder()
 	embedder.Err = &embedding.APIError{Provider: "fake", StatusCode: http.StatusTooManyRequests, Message: "quota"}
-	dlq := &fakeDeadLetters{}
+	deadLetters := &fakeDeadLetters{}
 
 	const attempts = 3
-	if err := newCDCTestPipelineWith(t, st, embedder, dlq, attempts).Process(context.Background(), changeMessage("c", cdcTestID, 1, 0)); err != nil {
+	if err := newCDCTestPipelineWith(t, st, embedder, deadLetters, attemptsPolicy(attempts)).Process(context.Background(), changeMessage("c", cdcTestID, 1, 0)); err != nil {
 		t.Fatalf("Process returned %v, want nil once the message is dead-lettered", err)
 	}
 
 	if got := len(embedder.Calls()); got != attempts {
 		t.Errorf("embed calls = %d, want %d: a rate limit is worth retrying", got, attempts)
 	}
-	if len(dlq.causes) != 1 || !errors.Is(dlq.causes[0], embedding.ErrRateLimited) {
-		t.Fatalf("dead-letter causes = %v, want one rate-limit failure", dlq.causes)
+	letter := deadLetters.only(t)
+	if letter.ErrorType != retry.Retryable.String() || letter.Attempts != attempts {
+		t.Fatalf("dead-letter message = type %q after %d attempts; want %q after %d",
+			letter.ErrorType, letter.Attempts, retry.Retryable, attempts)
+	}
+	if !strings.Contains(letter.Error, "status 429") {
+		t.Errorf("dead-letter error = %q, want it to report the rate limit", letter.Error)
 	}
 	documents, points := st.counts()
 	if documents != 1 || points != 0 {
@@ -129,17 +136,22 @@ func TestDimensionMismatchIsReturnedAndNotRetried(t *testing.T) {
 	st := newStores()
 	embedder := newFakeEmbedder()
 	embedder.Err = fmt.Errorf("fake: %w: expected 768, got 3", embedding.ErrDimensionMismatch)
-	dlq := &fakeDeadLetters{}
+	deadLetters := &fakeDeadLetters{}
 
-	if err := newCDCTestPipelineWith(t, st, embedder, dlq, 5).Process(context.Background(), changeMessage("u", cdcTestID, 1, 0)); err != nil {
+	if err := newCDCTestPipelineWith(t, st, embedder, deadLetters, attemptsPolicy(5)).Process(context.Background(), changeMessage("u", cdcTestID, 1, 0)); err != nil {
 		t.Fatalf("Process returned %v, want nil once the message is dead-lettered", err)
 	}
 
 	if got := len(embedder.Calls()); got != 1 {
 		t.Errorf("embed calls = %d, want 1: a dimension mismatch cannot succeed on retry", got)
 	}
-	if len(dlq.causes) != 1 || !errors.Is(dlq.causes[0], embedding.ErrDimensionMismatch) {
-		t.Fatalf("dead-letter causes = %v, want one dimension mismatch", dlq.causes)
+	letter := deadLetters.only(t)
+	if letter.ErrorType != retry.NonRetryable.String() || letter.Attempts != 1 {
+		t.Fatalf("dead-letter message = type %q after %d attempts; want %q after 1",
+			letter.ErrorType, letter.Attempts, retry.NonRetryable)
+	}
+	if !strings.Contains(letter.Error, embedding.ErrDimensionMismatch.Error()) {
+		t.Errorf("dead-letter error = %q, want it to report the dimension mismatch", letter.Error)
 	}
 	if _, points := st.counts(); points != 0 {
 		t.Errorf("points = %d, want none: a wrong-sized vector must never be stored", points)
@@ -151,7 +163,7 @@ func TestDimensionMismatchIsReturnedAndNotRetried(t *testing.T) {
 // instead of being dead-lettered.
 func TestEmbeddingStopsWhenTheWorkerIsCancelled(t *testing.T) {
 	st := newStores()
-	dlq := &fakeDeadLetters{}
+	deadLetters := &fakeDeadLetters{}
 	started := make(chan struct{})
 
 	blocking := cdc.EmbedderFunc(func(ctx context.Context, _ string) ([]float32, error) {
@@ -166,12 +178,12 @@ func TestEmbeddingStopsWhenTheWorkerIsCancelled(t *testing.T) {
 		cancel()
 	}()
 
-	err := newCDCTestPipelineWith(t, st, blocking, dlq, 3).Process(ctx, changeMessage("c", cdcTestID, 1, 0))
+	err := newCDCTestPipelineWith(t, st, blocking, deadLetters, attemptsPolicy(3)).Process(ctx, changeMessage("c", cdcTestID, 1, 0))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Process = %v, want context.Canceled so the offset is not committed", err)
 	}
-	if len(dlq.causes) != 0 {
-		t.Errorf("a cancelled message was dead-lettered: %v", dlq.causes)
+	if deadLetters.count() != 0 {
+		t.Errorf("a cancelled message was dead-lettered: %v", deadLetters.all())
 	}
 }
 

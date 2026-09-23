@@ -13,28 +13,32 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"near-real-time-hybrid-search-engine/internal/api"
 	"near-real-time-hybrid-search-engine/internal/config"
+	"near-real-time-hybrid-search-engine/internal/embedding"
 	"near-real-time-hybrid-search-engine/internal/postgres"
-	"near-real-time-hybrid-search-engine/internal/search"
+	"near-real-time-hybrid-search-engine/internal/search/hybrid"
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
 	"near-real-time-hybrid-search-engine/internal/search/qdrant"
+	"near-real-time-hybrid-search-engine/internal/startup"
 )
 
-const (
-	startupTimeout    = 10 * time.Second
-	readHeaderTimeout = 5 * time.Second
-)
+const readHeaderTimeout = 5 * time.Second
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	if err := run(logger); err != nil {
+	// Info until the configuration names a level. Records logged with a
+	// request's context carry its request ID.
+	level := new(slog.LevelVar)
+	logger := slog.New(api.NewLogHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})))
+	if err := run(logger, level); err != nil {
 		logger.Error("api stopped with error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger) error {
+func run(logger *slog.Logger, level *slog.LevelVar) error {
 	// rootCtx is the parent of every request context. Cancelling it after the
 	// shutdown grace period stops any requests that are still running.
 	rootCtx, cancel := context.WithCancel(context.Background())
@@ -47,12 +51,19 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	level.Set(cfg.App.LogLevel)
 	logger.Info("starting api", "app", cfg.App.Name, "env", cfg.App.Env, "addr", cfg.Server.Addr())
 
-	initCtx, cancelInit := context.WithTimeout(ctx, startupTimeout)
+	// Dependencies may still be starting; each is retried until this deadline.
+	initCtx, cancelInit := context.WithTimeout(ctx, cfg.App.StartupTimeout)
 	defer cancelInit()
 
-	pool, err := postgres.New(initCtx, cfg.PostgreSQL)
+	var pool *pgxpool.Pool
+	err = startup.Retry(initCtx, logger, "postgres", func(ctx context.Context) error {
+		var err error
+		pool, err = postgres.New(ctx, cfg.PostgreSQL)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("init postgres: %w", err)
 	}
@@ -68,7 +79,7 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init opensearch: %w", err)
 	}
 	defer closeWithLog(logger, "opensearch", osClient.Close)
-	if err := osClient.Ping(initCtx); err != nil {
+	if err := startup.Retry(initCtx, logger, "opensearch", osClient.Ping); err != nil {
 		return fmt.Errorf("init opensearch: %w", err)
 	}
 	logger.Info("connected to opensearch", "index", cfg.OpenSearch.Index)
@@ -78,17 +89,50 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("init qdrant: %w", err)
 	}
 	defer closeWithLog(logger, "qdrant", qdClient.Close)
-	if err := qdClient.Ping(initCtx); err != nil {
+	if err := startup.Retry(initCtx, logger, "qdrant", qdClient.Ping); err != nil {
 		return fmt.Errorf("init qdrant: %w", err)
 	}
 	logger.Info("connected to qdrant", "collection", cfg.Qdrant.Collection, "vector_size", cfg.Qdrant.VectorSize)
 
-	svc := search.NewService(osClient, qdClient, postgres.NewRepository(pool))
-	handler := api.NewHandler(svc, logger)
+	embedder, err := embedding.New(initCtx, cfg.Embedding)
+	if err != nil {
+		return fmt.Errorf("init embedding provider: %w", err)
+	}
+	// The fake provider is for tests and local runs; its vectors mean nothing.
+	if cfg.App.Env == "production" && embedder.Name() == embedding.ProviderFake {
+		return fmt.Errorf("init embedding provider: the %q provider must not run in production", embedding.ProviderFake)
+	}
+	// Query vectors are compared with the stored document vectors, so they
+	// must have the collection's dimension.
+	if embedder.Dimension() != cfg.Qdrant.VectorSize {
+		return fmt.Errorf("init embedding provider: %s produces %d-dimensional vectors but QDRANT_VECTOR_SIZE is %d",
+			embedder.Name(), embedder.Dimension(), cfg.Qdrant.VectorSize)
+	}
+	logger.Info("embedding provider ready",
+		"provider", embedder.Name(), "model", cfg.Embedding.Model, "dimension", embedder.Dimension())
+
+	svc, err := hybrid.New(osClient, qdClient, embedder, cfg.Search, logger)
+	if err != nil {
+		return fmt.Errorf("init hybrid search: %w", err)
+	}
+	logger.Info("hybrid search ready",
+		"default_limit", cfg.Search.DefaultLimit, "max_limit", cfg.Search.MaxLimit,
+		"candidate_limit", cfg.Search.CandidateLimit, "rrf_k", cfg.Search.RRFK, "timeout", cfg.Search.Timeout)
+
+	router := api.NewRouter(
+		api.NewSearchHandler(svc, cfg.Search.Timeout),
+		// The embedding provider has no free health check; a failing provider
+		// shows up as failed searches rather than as not ready.
+		api.NewReadinessHandler(logger,
+			api.ReadinessCheck{Name: "opensearch", Check: osClient.Ping},
+			api.ReadinessCheck{Name: "qdrant", Check: qdClient.Ping},
+		),
+		logger,
+	)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr(),
-		Handler:           api.NewRouter(handler),
+		Handler:           router,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       cfg.Server.ReadTimeout,
 		WriteTimeout:      cfg.Server.WriteTimeout,

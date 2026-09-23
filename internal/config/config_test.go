@@ -1,10 +1,13 @@
 package config
 
 import (
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"near-real-time-hybrid-search-engine/internal/search/rrf"
 )
 
 // requiredVars are the variables Load refuses to run without.
@@ -20,7 +23,7 @@ var requiredVars = map[string]string{
 // optionalVars is every other variable Load reads. Tests set them all so that
 // results never depend on the developer's own environment.
 var optionalVars = []string{
-	"APP_ENV", "APP_NAME",
+	"APP_ENV", "APP_NAME", "APP_STARTUP_TIMEOUT", "LOG_LEVEL",
 	"HTTP_HOST", "HTTP_PORT",
 	"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT", "HTTP_SHUTDOWN_TIMEOUT",
 	"DATABASE_MAX_CONNS", "DATABASE_MIN_CONNS", "DATABASE_MAX_CONN_LIFETIME",
@@ -28,7 +31,9 @@ var optionalVars = []string{
 	"KAFKA_DLQ_TOPIC", "KAFKA_WORKERS",
 	"OPENSEARCH_USERNAME", "OPENSEARCH_PASSWORD", "OPENSEARCH_INDEX",
 	"QDRANT_API_KEY", "QDRANT_COLLECTION", "QDRANT_VECTOR_SIZE",
-	"INDEXING_WORKERS", "INDEXING_QUEUE_SIZE", "INDEXING_BATCH_SIZE", "INDEXING_RETRY_ATTEMPTS",
+	"SEARCH_DEFAULT_LIMIT", "SEARCH_MAX_LIMIT", "SEARCH_CANDIDATE_LIMIT", "RRF_K", "SEARCH_TIMEOUT",
+	"INDEXING_WORKERS", "INDEXING_QUEUE_SIZE", "INDEXING_BATCH_SIZE",
+	"KAFKA_RETRY_MAX_ATTEMPTS", "KAFKA_RETRY_INITIAL_BACKOFF", "KAFKA_RETRY_MAX_BACKOFF", "KAFKA_RETRY_MULTIPLIER",
 	"EMBEDDING_PROVIDER", "EMBEDDING_API_KEY", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION", "EMBEDDING_TIMEOUT",
 }
 
@@ -61,6 +66,8 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}{
 		{"App.Env", cfg.App.Env, "development"},
 		{"App.Name", cfg.App.Name, "near-realtime-search"},
+		{"App.StartupTimeout", cfg.App.StartupTimeout, 60 * time.Second},
+		{"App.LogLevel", cfg.App.LogLevel, slog.LevelInfo},
 		{"Server.Addr", cfg.Server.Addr(), "0.0.0.0:8080"},
 		{"Server.Port", cfg.Server.Port, 8080},
 		{"Server.ReadTimeout", cfg.Server.ReadTimeout, 10 * time.Second},
@@ -84,7 +91,10 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		{"Indexing.Workers", cfg.Indexing.Workers, 10},
 		{"Indexing.QueueSize", cfg.Indexing.QueueSize, 1000},
 		{"Indexing.BatchSize", cfg.Indexing.BatchSize, 100},
-		{"Indexing.RetryAttempts", cfg.Indexing.RetryAttempts, 3},
+		{"Kafka.Retry.MaxAttempts", cfg.Kafka.Retry.MaxAttempts, 5},
+		{"Kafka.Retry.InitialBackoff", cfg.Kafka.Retry.InitialBackoff, 500 * time.Millisecond},
+		{"Kafka.Retry.MaxBackoff", cfg.Kafka.Retry.MaxBackoff, 30 * time.Second},
+		{"Kafka.Retry.Multiplier", cfg.Kafka.Retry.Multiplier, 2.0},
 		{"Embedding.Provider", cfg.Embedding.Provider, "gemini"},
 		{"Embedding.APIKey", cfg.Embedding.APIKey, ""},
 		{"Embedding.Model", cfg.Embedding.Model, "gemini-embedding-2"},
@@ -100,37 +110,40 @@ func TestLoadAppliesDefaults(t *testing.T) {
 
 func TestLoadSuccess(t *testing.T) {
 	setEnv(t, map[string]string{
-		"APP_ENV":                    "production",
-		"APP_NAME":                   "search",
-		"HTTP_HOST":                  "127.0.0.1",
-		"HTTP_PORT":                  "9090",
-		"HTTP_READ_TIMEOUT":          "5s",
-		"HTTP_WRITE_TIMEOUT":         "15s",
-		"HTTP_IDLE_TIMEOUT":          "1m30s",
-		"HTTP_SHUTDOWN_TIMEOUT":      "20s",
-		"KAFKA_DLQ_TOPIC":            "document-events.failed",
-		"KAFKA_WORKERS":              "6",
-		"OPENSEARCH_URL":             "https://opensearch.internal:9200",
-		"OPENSEARCH_USERNAME":        "search",
-		"OPENSEARCH_PASSWORD":        "not-a-real-password",
-		"OPENSEARCH_INDEX":           "docs-v2",
-		"QDRANT_URL":                 "https://qdrant.internal:6334",
-		"QDRANT_API_KEY":             "not-a-real-key",
-		"QDRANT_COLLECTION":          "docs-v2",
-		"DATABASE_MAX_CONNS":         "40",
-		"DATABASE_MIN_CONNS":         "5",
-		"DATABASE_MAX_CONN_LIFETIME": "2h",
-		"DATABASE_CONNECT_TIMEOUT":   "3s",
-		"INDEXING_WORKERS":           "4",
-		"INDEXING_QUEUE_SIZE":        "200",
-		"INDEXING_BATCH_SIZE":        "50",
-		"INDEXING_RETRY_ATTEMPTS":    "5",
-		"EMBEDDING_PROVIDER":         " Gemini ",
-		"EMBEDDING_API_KEY":          "not-a-real-key",
-		"EMBEDDING_MODEL":            "gemini-embedding-001",
-		"EMBEDDING_DIMENSION":        "1536",
-		"EMBEDDING_TIMEOUT":          "3s",
-		"QDRANT_VECTOR_SIZE":         "1536",
+		"APP_ENV":                     "production",
+		"APP_NAME":                    "search",
+		"HTTP_HOST":                   "127.0.0.1",
+		"HTTP_PORT":                   "9090",
+		"HTTP_READ_TIMEOUT":           "5s",
+		"HTTP_WRITE_TIMEOUT":          "15s",
+		"HTTP_IDLE_TIMEOUT":           "1m30s",
+		"HTTP_SHUTDOWN_TIMEOUT":       "20s",
+		"KAFKA_DLQ_TOPIC":             "document-events.failed",
+		"KAFKA_WORKERS":               "6",
+		"OPENSEARCH_URL":              "https://opensearch.internal:9200",
+		"OPENSEARCH_USERNAME":         "search",
+		"OPENSEARCH_PASSWORD":         "not-a-real-password",
+		"OPENSEARCH_INDEX":            "docs-v2",
+		"QDRANT_URL":                  "https://qdrant.internal:6334",
+		"QDRANT_API_KEY":              "not-a-real-key",
+		"QDRANT_COLLECTION":           "docs-v2",
+		"DATABASE_MAX_CONNS":          "40",
+		"DATABASE_MIN_CONNS":          "5",
+		"DATABASE_MAX_CONN_LIFETIME":  "2h",
+		"DATABASE_CONNECT_TIMEOUT":    "3s",
+		"INDEXING_WORKERS":            "4",
+		"INDEXING_QUEUE_SIZE":         "200",
+		"INDEXING_BATCH_SIZE":         "50",
+		"KAFKA_RETRY_MAX_ATTEMPTS":    "7",
+		"KAFKA_RETRY_INITIAL_BACKOFF": "250ms",
+		"KAFKA_RETRY_MAX_BACKOFF":     "1m",
+		"KAFKA_RETRY_MULTIPLIER":      "1.5",
+		"EMBEDDING_PROVIDER":          " Gemini ",
+		"EMBEDDING_API_KEY":           "not-a-real-key",
+		"EMBEDDING_MODEL":             "gemini-embedding-001",
+		"EMBEDDING_DIMENSION":         "1536",
+		"EMBEDDING_TIMEOUT":           "3s",
+		"QDRANT_VECTOR_SIZE":          "1536",
 	})
 
 	cfg, err := Load()
@@ -158,9 +171,13 @@ func TestLoadSuccess(t *testing.T) {
 		cfg.Qdrant.APIKey != "not-a-real-key" || cfg.Qdrant.VectorSize != 1536 {
 		t.Errorf("Qdrant = %+v", cfg.Qdrant)
 	}
-	want := IndexingConfig{Workers: 4, QueueSize: 200, BatchSize: 50, RetryAttempts: 5}
+	want := IndexingConfig{Workers: 4, QueueSize: 200, BatchSize: 50}
 	if cfg.Indexing != want {
 		t.Errorf("Indexing = %+v, want %+v", cfg.Indexing, want)
+	}
+	wantRetry := RetryConfig{MaxAttempts: 7, InitialBackoff: 250 * time.Millisecond, MaxBackoff: time.Minute, Multiplier: 1.5}
+	if cfg.Kafka.Retry != wantRetry {
+		t.Errorf("Kafka.Retry = %+v, want %+v", cfg.Kafka.Retry, wantRetry)
 	}
 	wantEmbedding := EmbeddingConfig{
 		Provider:  "gemini", // trimmed and lowercased
@@ -206,6 +223,9 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"db min above max", "DATABASE_MIN_CONNS", "50", "must not exceed DATABASE_MAX_CONNS"},
 		{"invalid db lifetime", "DATABASE_MAX_CONN_LIFETIME", "1 hour", "invalid DATABASE_MAX_CONN_LIFETIME"},
 		{"zero db connect timeout", "DATABASE_CONNECT_TIMEOUT", "0s", "DATABASE_CONNECT_TIMEOUT must be positive"},
+		{"zero startup timeout", "APP_STARTUP_TIMEOUT", "0s", "APP_STARTUP_TIMEOUT must be positive"},
+		{"unknown log level", "LOG_LEVEL", "verbose", "invalid LOG_LEVEL"},
+		{"debug log level", "LOG_LEVEL", "debug", ""},
 		{"invalid vector size", "QDRANT_VECTOR_SIZE", "big", "invalid QDRANT_VECTOR_SIZE"},
 		{"zero vector size", "QDRANT_VECTOR_SIZE", "0", "QDRANT_VECTOR_SIZE must be positive"},
 		{"vector size differs from embedding model", "QDRANT_VECTOR_SIZE", "384", "must match EMBEDDING_DIMENSION"},
@@ -215,7 +235,15 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"zero embedding timeout", "EMBEDDING_TIMEOUT", "0s", "EMBEDDING_TIMEOUT must be positive"},
 		{"db min conns may be zero", "DATABASE_MIN_CONNS", "0", ""},
 		{"zero queue size", "INDEXING_QUEUE_SIZE", "0", "INDEXING_QUEUE_SIZE must be positive"},
-		{"zero retry attempts", "INDEXING_RETRY_ATTEMPTS", "0", "INDEXING_RETRY_ATTEMPTS must be positive"},
+		{"zero retry attempts", "KAFKA_RETRY_MAX_ATTEMPTS", "0", "KAFKA_RETRY_MAX_ATTEMPTS must be positive"},
+		{"one attempt disables retrying", "KAFKA_RETRY_MAX_ATTEMPTS", "1", ""},
+		{"invalid retry attempts", "KAFKA_RETRY_MAX_ATTEMPTS", "many", "invalid KAFKA_RETRY_MAX_ATTEMPTS"},
+		{"zero initial backoff", "KAFKA_RETRY_INITIAL_BACKOFF", "0s", "KAFKA_RETRY_INITIAL_BACKOFF must be positive"},
+		{"invalid initial backoff", "KAFKA_RETRY_INITIAL_BACKOFF", "500", "invalid KAFKA_RETRY_INITIAL_BACKOFF"},
+		{"max backoff below initial", "KAFKA_RETRY_MAX_BACKOFF", "100ms", "must not be shorter than KAFKA_RETRY_INITIAL_BACKOFF"},
+		{"shrinking multiplier", "KAFKA_RETRY_MULTIPLIER", "0.5", "KAFKA_RETRY_MULTIPLIER must be a finite number of at least 1"},
+		{"constant multiplier is allowed", "KAFKA_RETRY_MULTIPLIER", "1", ""},
+		{"invalid multiplier", "KAFKA_RETRY_MULTIPLIER", "double", "invalid KAFKA_RETRY_MULTIPLIER"},
 		{"negative timeout", "HTTP_IDLE_TIMEOUT", "-5s", "HTTP_IDLE_TIMEOUT must be positive"},
 		{"port out of range", "HTTP_PORT", "70000", "HTTP_PORT must be between"},
 		{"opensearch url without scheme", "OPENSEARCH_URL", "localhost:9200", "invalid OPENSEARCH_URL"},
@@ -329,5 +357,47 @@ func TestLoadDoesNotRequireEmbeddingAPIKey(t *testing.T) {
 	}
 	if cfg.Embedding.APIKey != "" {
 		t.Errorf("Embedding.APIKey = %q, want empty", cfg.Embedding.APIKey)
+	}
+}
+
+func TestSearchSettings(t *testing.T) {
+	setEnv(t, nil)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := SearchConfig{DefaultLimit: 10, MaxLimit: 50, CandidateLimit: 50, RRFK: rrf.DefaultK, Timeout: 5 * time.Second}
+	if cfg.Search != want {
+		t.Errorf("defaults = %+v, want %+v", cfg.Search, want)
+	}
+
+	tests := []struct {
+		name        string
+		env         map[string]string
+		wantInError string
+	}{
+		{"custom values", map[string]string{"SEARCH_DEFAULT_LIMIT": "5", "SEARCH_MAX_LIMIT": "20", "SEARCH_CANDIDATE_LIMIT": "40", "RRF_K": "30"}, ""},
+		{"zero default limit", map[string]string{"SEARCH_DEFAULT_LIMIT": "0"}, "SEARCH_DEFAULT_LIMIT must be positive"},
+		{"invalid rrf k", map[string]string{"RRF_K": "sixty"}, "invalid RRF_K"},
+		{"zero rrf k", map[string]string{"RRF_K": "0"}, "RRF_K must be positive"},
+		{"default above max", map[string]string{"SEARCH_DEFAULT_LIMIT": "60"}, "must not exceed SEARCH_MAX_LIMIT"},
+		{"max above candidates", map[string]string{"SEARCH_MAX_LIMIT": "80"}, "must not exceed SEARCH_CANDIDATE_LIMIT"},
+		{"invalid timeout", map[string]string{"SEARCH_TIMEOUT": "5"}, "invalid SEARCH_TIMEOUT"},
+		{"timeout not below write timeout", map[string]string{"SEARCH_TIMEOUT": "10s"}, "must be shorter than HTTP_WRITE_TIMEOUT"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setEnv(t, tt.env)
+			_, err := Load()
+			if tt.wantInError == "" {
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantInError) {
+				t.Fatalf("err = %v, want it to contain %q", err, tt.wantInError)
+			}
+		})
 	}
 }

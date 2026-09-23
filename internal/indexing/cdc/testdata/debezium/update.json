@@ -1,0 +1,32 @@
+{
+  "before": null,
+  "after": {
+    "id": "5f2a9c1e-7b3d-4a6f-8e21-9c0d1b2a3f44",
+    "title": "Exactly-Once Semantics in Kafka",
+    "body": "Idempotent producers, transactions and read_committed consumers give Kafka exactly-once processing.",
+    "version": 12,
+    "updated_at": "2026-09-22T09:31:02.25Z",
+    "url": "https://example.com/articles/exactly-once"
+  },
+  "source": {
+    "version": "3.6.3.Final",
+    "connector": "postgresql",
+    "name": "search",
+    "ts_ms": 1790069462250,
+    "snapshot": "false",
+    "db": "searchdb",
+    "sequence": "[\"24100456\",\"24100912\"]",
+    "ts_us": 1790069462250000,
+    "ts_ns": 1790069462250000000,
+    "schema": "public",
+    "table": "documents",
+    "txId": 762,
+    "lsn": 24100912,
+    "xmin": null
+  },
+  "transaction": null,
+  "op": "u",
+  "ts_ms": 1790069462400,
+  "ts_us": 1790069462400111,
+  "ts_ns": 1790069462400111000
+}

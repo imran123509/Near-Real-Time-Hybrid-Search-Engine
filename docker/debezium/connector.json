@@ -1,0 +1,26 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "tasks.max": "1",
+  "plugin.name": "pgoutput",
+
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "${env:DEBEZIUM_DB_USER}",
+  "database.password": "${env:DEBEZIUM_DB_PASSWORD}",
+  "database.dbname": "${env:POSTGRES_DB}",
+
+  "topic.prefix": "search",
+  "table.include.list": "public.documents",
+
+  "publication.name": "search_documents",
+  "publication.autocreate.mode": "disabled",
+  "slot.name": "search_documents",
+
+  "snapshot.mode": "initial",
+  "tombstones.on.delete": "true",
+
+  "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "key.converter.schemas.enable": "false",
+  "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+  "value.converter.schemas.enable": "false"
+}

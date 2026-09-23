@@ -63,13 +63,13 @@ func NewIndexer(
 // current even while the embedding provider is slow or down, and the only
 // partial state is the keyword index being ahead of the vector index until
 // the event is retried.
-func (ix *Indexer) Index(ctx context.Context, ev Event) error {
+func (ix *Indexer) Index(ctx context.Context, ev Event) (cdc.Effect, error) {
 	row, err := ix.documents.GetDocument(ctx, ev.DocumentID)
 	if errors.Is(err, postgres.ErrNotFound) {
 		return ix.delete(ctx, ev.DocumentID)
 	}
 	if err != nil {
-		return fmt.Errorf("load document: %w", err)
+		return cdc.EffectNone, fmt.Errorf("load document: %w", err)
 	}
 
 	doc := opensearch.Document{
@@ -81,16 +81,22 @@ func (ix *Indexer) Index(ctx context.Context, ev Event) error {
 	}
 	text := cdc.BuildEmbeddingText(doc)
 	if text == "" {
-		return permanent(fmt.Errorf("document %s: %w", doc.ID, embedding.ErrEmptyText))
+		return cdc.EffectNone, permanent(fmt.Errorf("document %s: %w", doc.ID, embedding.ErrEmptyText))
 	}
 
-	if err := ix.keyword.IndexDocument(ctx, doc); err != nil {
-		return fmt.Errorf("index in opensearch: %w", classifyKeyword(err))
+	written, err := ix.keyword.IndexDocument(ctx, doc)
+	if err != nil {
+		return cdc.EffectNone, fmt.Errorf("index in opensearch: %w", classifyKeyword(err))
+	}
+	// The keyword index holds a newer row than the one just read, so this
+	// event has been overtaken; writing its vector would undo that.
+	if written == opensearch.WriteStale {
+		return cdc.EffectStale, nil
 	}
 
 	vector, err := ix.embedder.Embed(ctx, text)
 	if err != nil {
-		return fmt.Errorf("embed document: %w", classifyEmbedding(err))
+		return cdc.EffectNone, fmt.Errorf("embed document: %w", classifyEmbedding(err))
 	}
 
 	err = ix.vectors.Upsert(ctx, qdrant.Point{
@@ -99,19 +105,22 @@ func (ix *Indexer) Index(ctx context.Context, ev Event) error {
 		Payload: map[string]any{"title": doc.Title, "version": doc.Version},
 	})
 	if err != nil {
-		return fmt.Errorf("index in qdrant: %w", classifyVector(err))
+		return cdc.EffectNone, fmt.Errorf("index in qdrant: %w", classifyVector(err))
 	}
-	return nil
+	if written == opensearch.WriteDuplicate {
+		return cdc.EffectReapplied, nil
+	}
+	return cdc.EffectIndexed, nil
 }
 
-func (ix *Indexer) delete(ctx context.Context, id string) error {
+func (ix *Indexer) delete(ctx context.Context, id string) (cdc.Effect, error) {
 	if err := ix.keyword.DeleteDocument(ctx, id); err != nil {
-		return fmt.Errorf("delete from opensearch: %w", classifyKeyword(err))
+		return cdc.EffectNone, fmt.Errorf("delete from opensearch: %w", classifyKeyword(err))
 	}
 	if err := ix.vectors.Delete(ctx, id); err != nil {
-		return fmt.Errorf("delete from qdrant: %w", classifyVector(err))
+		return cdc.EffectNone, fmt.Errorf("delete from qdrant: %w", classifyVector(err))
 	}
-	return nil
+	return cdc.EffectDeleted, nil
 }
 
 // EnsureStores creates the OpenSearch index and Qdrant collection if they do

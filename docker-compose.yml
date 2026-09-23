@@ -1,14 +1,283 @@
+# Local stack for the Near Real-Time Hybrid Search Engine.
+#
+#   PostgreSQL --WAL--> Debezium (Kafka Connect) --> Kafka --> consumer --> OpenSearch + Qdrant
+#                                                         api --> OpenSearch + Qdrant (+ embedding API)
+#
+# Setup: copy .env.example to .env, set EMBEDDING_API_KEY, then
+#   docker compose up -d --build
+#
+# Containers reach each other by service name (postgres, kafka, opensearch,
+# qdrant, debezium). The host reaches them on the published localhost ports.
+# Credentials come from .env; nothing secret is written in this file.
+
+name: near-realtime-search
+
+# Settings shared by the api and consumer containers. They point at service
+# names, unlike .env, whose application settings are for running on the host.
+x-app-environment: &app-environment
+  APP_ENV: development
+  # Bounded wait for dependencies that are still starting.
+  APP_STARTUP_TIMEOUT: 120s
+  # debug shows one "event indexed" line per change the consumer applies.
+  LOG_LEVEL: ${LOG_LEVEL:-debug}
+  DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?copy .env.example to .env}@postgres:5432/${POSTGRES_DB:-searchdb}?sslmode=disable
+  KAFKA_BROKERS: kafka:9092
+  # Debezium names the topic <topic.prefix>.<schema>.<table>; see
+  # docker/debezium/connector.json.
+  KAFKA_TOPIC: search.public.documents
+  KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-near-realtime-search}
+  OPENSEARCH_URL: http://opensearch:9200
+  OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-documents}
+  # The Go client speaks gRPC, which Qdrant serves on 6334.
+  QDRANT_URL: http://qdrant:6334
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-documents}
+  EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-gemini}
+  EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-gemini-embedding-2}
+  # The Qdrant collection is created with this size (QDRANT_VECTOR_SIZE
+  # defaults to it), and both services refuse to start if they disagree.
+  EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+
 services:
+  postgres:
+    image: postgres:18.6
+    command:
+      - postgres
+      # Logical decoding, which Debezium's pgoutput plugin reads the WAL with.
+      # max_wal_senders and max_replication_slots already default to 10.
+      - -c
+      - wal_level=logical
+      # A replication slot pins WAL until its reader catches up. Cap it, so a
+      # stopped Debezium cannot fill the disk; past the cap the slot is
+      # invalidated and the connector has to snapshot again.
+      - -c
+      - max_slot_wal_keep_size=1GB
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:-searchdb}
+      # Used by docker/postgres/initdb/20-debezium.sh to create the CDC role.
+      DEBEZIUM_DB_USER: ${DEBEZIUM_DB_USER:-debezium}
+      DEBEZIUM_DB_PASSWORD: ${DEBEZIUM_DB_PASSWORD:?copy .env.example to .env}
+    ports:
+      # Override the host port in .env when something already uses 5432.
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18 images keep data under /var/lib/postgresql/18/docker and
+      # expect the volume at /var/lib/postgresql.
+      - postgres-data:/var/lib/postgresql
+      - ./migrations:/migrations:ro
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # TCP, not the socket: while the init scripts run, the image serves a
+      # temporary socket-only instance that must not count as ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  kafka:
+    # A single KRaft node acting as both broker and controller; no ZooKeeper.
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # INTERNAL is for containers, EXTERNAL for the host (localhost:29092).
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # One broker, so every internal topic has one replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init, so a misspelled topic
+      # name fails loudly instead of silently creating an empty topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Creates the topics the pipeline uses, once Kafka is up, then exits.
+  kafka-init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        topics=/opt/kafka/bin/kafka-topics.sh
+        # Debezium keys each event by primary key, so all events for one
+        # document land in the same partition, in order.
+        $$topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic search.public.documents --partitions 3 --replication-factor 1
+        # Messages the consumer could not index (see KAFKA_DLQ_TOPIC).
+        $$topics --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic search.public.documents.dlq --partitions 1 --replication-factor 1
+        $$topics --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  debezium:
+    # Kafka Connect with the Debezium connectors, from quay.io, where Debezium
+    # publishes its current images.
+    image: quay.io/debezium/connect:3.6.3.Final
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: search-debezium
+      CONFIG_STORAGE_TOPIC: debezium_connect_configs
+      OFFSET_STORAGE_TOPIC: debezium_connect_offsets
+      STATUS_STORAGE_TOPIC: debezium_connect_statuses
+      # CONNECT_* variables become worker properties: CONNECT_A_B -> a.b.
+      # Connect's own topics default to 3 replicas; there is one broker.
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Lets connector.json refer to ${env:NAME} instead of holding secrets.
+      # The REST API returns the placeholders, never the resolved values.
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      DEBEZIUM_DB_USER: ${DEBEZIUM_DB_USER:-debezium}
+      DEBEZIUM_DB_PASSWORD: ${DEBEZIUM_DB_PASSWORD:?copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:-searchdb}
+    ports:
+      - "${CONNECT_HOST_PORT:-8083}:8083"
+    healthcheck:
+      # Plain bash, so the check does not depend on curl being in the image.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8083 && printf 'GET /connectors HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 30s
+
+  # Registers docker/debezium/connector.json with Kafka Connect, then exits.
+  # Re-run with: docker compose run --rm debezium-register
+  debezium-register:
+    image: curlimages/curl:8.22.0
+    depends_on:
+      debezium:
+        condition: service_healthy
+    working_dir: /work
+    environment:
+      CONNECT_URL: http://debezium:8083
+      CONNECTOR_CONFIG: /work/docker/debezium/connector.json
+    volumes:
+      - ./scripts/register-debezium.sh:/work/scripts/register-debezium.sh:ro
+      - ./docker/debezium/connector.json:/work/docker/debezium/connector.json:ro
+    entrypoint: ["sh", "/work/scripts/register-debezium.sh"]
+    restart: "no"
+
+  opensearch:
+    # 3.6 is the newest release the opensearch-go 4.x client is tested against.
+    image: opensearchproject/opensearch:3.6.0
+    environment:
+      discovery.type: single-node
+      # Local development only: plain HTTP, no authentication.
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "${OPENSEARCH_HOST_PORT:-9200}:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      # A single node never assigns replicas, so yellow is as good as it gets.
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' > /dev/null"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  qdrant:
+    # Matches the 1.19 Go client, which expects a server within one minor version.
+    image: qdrant/qdrant:v1.19.1
+    ports:
+      - "${QDRANT_REST_HOST_PORT:-6333}:6333" # REST and dashboard
+      - "${QDRANT_GRPC_HOST_PORT:-6334}:6334" # gRPC, used by the Go services
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+
   api:
     build:
       context: .
-      args:
-        SERVICE: api
+      target: api
+    image: near-realtime-search/api:dev
+    environment:
+      <<: *app-environment
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8080"
     ports:
-      - "8080:8080"
+      - "${API_HOST_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    # Bounded: a configuration error must not become an endless restart loop.
+    restart: on-failure:3
 
   consumer:
     build:
       context: .
-      args:
-        SERVICE: consumer
+      target: consumer
+    image: near-realtime-search/consumer:dev
+    # The consumer never queries PostgreSQL (each event carries its row), but
+    # configuration loading still requires DATABASE_URL, so it gets one.
+    environment:
+      <<: *app-environment
+      # Where messages go once they cannot be indexed. kafka-init creates this
+      # topic, and auto-creation is off, so the name must match it.
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-search.public.documents.dlq}
+      # Attempts per message and the waits between them: 500ms, 1s, 2s, 4s,
+      # capped at 30s. See "Retries and the dead-letter queue" in README.md.
+      KAFKA_RETRY_MAX_ATTEMPTS: ${KAFKA_RETRY_MAX_ATTEMPTS:-5}
+      KAFKA_RETRY_INITIAL_BACKOFF: ${KAFKA_RETRY_INITIAL_BACKOFF:-500ms}
+      KAFKA_RETRY_MAX_BACKOFF: ${KAFKA_RETRY_MAX_BACKOFF:-30s}
+      KAFKA_RETRY_MULTIPLIER: ${KAFKA_RETRY_MULTIPLIER:-2}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      opensearch:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    restart: on-failure:3
+
+volumes:
+  postgres-data:
+  kafka-data:
+  opensearch-data:
+  qdrant-data:

@@ -95,6 +95,10 @@ func (p Parser) Parse(data []byte) (ChangeEvent, error) {
 		Table:     env.Source.Table,
 		Row:       row,
 		Timestamp: env.changeTime(),
+		Database:  env.Source.DB,
+		LSN:       value(env.Source.LSN),
+		TxID:      value(env.Source.TxID),
+		Snapshot:  env.Source.fromSnapshot(),
 	}, nil
 }
 
@@ -186,10 +190,44 @@ type envelope struct {
 }
 
 // source is the origin metadata Debezium attaches to every event.
+//
+// LSN and TxID come from the PostgreSQL connector and say where in the
+// write-ahead log the change was read: they make an event identifiable and
+// orderable without the consumer having to invent either. Other connectors
+// name their position differently, which is why both are optional here.
 type source struct {
 	Schema string `json:"schema"`
 	Table  string `json:"table"`
 	TsMs   *int64 `json:"ts_ms"`
+	DB     string `json:"db"`
+	LSN    *int64 `json:"lsn"`
+	TxID   *int64 `json:"txId"`
+	// Snapshot is a string in current Debezium ("true", "first", "last",
+	// "false", "incremental") but was a boolean in older versions, so it is
+	// decoded loosely: a field that only feeds diagnostics must never turn a
+	// usable event into a malformed one.
+	Snapshot any `json:"snapshot"`
+}
+
+// fromSnapshot reports whether a source block says the row was read during a
+// snapshot rather than from the log.
+func (s source) fromSnapshot() bool {
+	switch v := s.Snapshot.(type) {
+	case bool:
+		return v
+	case string:
+		return v != "" && v != "false" && v != "incremental"
+	default:
+		return false
+	}
+}
+
+// value reads an optional number, treating an absent one as zero.
+func value(n *int64) int64 {
+	if n == nil {
+		return 0
+	}
+	return *n
 }
 
 // changeTime is when the change happened in the database. source.ts_ms is the

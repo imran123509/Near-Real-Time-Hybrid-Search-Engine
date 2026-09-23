@@ -29,20 +29,35 @@ func newFakeKeyword() *fakeKeyword {
 	return &fakeKeyword{docs: map[string]opensearch.Document{}}
 }
 
-func (f *fakeKeyword) IndexDocument(_ context.Context, doc opensearch.Document) error {
+func (f *fakeKeyword) IndexDocument(_ context.Context, doc opensearch.Document) (opensearch.WriteResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.indexCalls++
 	if f.indexErr != nil {
-		return f.indexErr
+		return opensearch.WriteUnknown, f.indexErr
 	}
 	// Mirrors the real client, where OpenSearch enforces external versioning
-	// server-side: a write with an older or equal version is ignored.
-	if existing, ok := f.docs[doc.ID]; ok && existing.Version > 0 && doc.Version > 0 && doc.Version <= existing.Version {
-		return nil
+	// server-side: a write whose version is not higher than the stored one is
+	// refused, and the client reports which of the two cases it was.
+	if existing, ok := f.docs[doc.ID]; ok && existing.Version > 0 && doc.Version > 0 {
+		switch {
+		case doc.Version < existing.Version:
+			return opensearch.WriteStale, nil
+		case doc.Version == existing.Version:
+			return opensearch.WriteDuplicate, nil
+		}
 	}
 	f.docs[doc.ID] = doc
-	return nil
+	return opensearch.WriteApplied, nil
+}
+
+// failIndexes makes every index call fail with err, until it is called again
+// with nil. It takes the lock, so a test may change its mind while the service
+// is running.
+func (f *fakeKeyword) failIndexes(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.indexErr = err
 }
 
 func (f *fakeKeyword) DeleteDocument(_ context.Context, id string) error {
@@ -106,6 +121,14 @@ func (f *fakeVectors) Delete(_ context.Context, id string) error {
 	return nil
 }
 
+// failUpserts makes every upsert fail with err, until it is called again with
+// nil.
+func (f *fakeVectors) failUpserts(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.upsertErr = err
+}
+
 func (f *fakeVectors) point(id string) (qdrant.Point, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -166,7 +189,7 @@ func TestServiceProcessCreate(t *testing.T) {
 	s := newTestService(t)
 	ev := parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "Indexing", "Change events keep indexes current.", 1)))
 
-	if err := s.service.Process(context.Background(), ev); err != nil {
+	if _, err := s.service.Process(context.Background(), ev); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 
@@ -206,14 +229,14 @@ func TestServiceProcessUpdateReusesTheDocumentID(t *testing.T) {
 	ctx := context.Background()
 
 	create := parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "First", "First body.", 1)))
-	if err := s.service.Process(ctx, create); err != nil {
+	if _, err := s.service.Process(ctx, create); err != nil {
 		t.Fatalf("Process create: %v", err)
 	}
 
 	update := parse(t, debeziumEvent("u",
 		documentRow(testDocumentID, "First", "First body.", 1),
 		documentRow(testDocumentID, "Second", "Second body.", 2)))
-	if err := s.service.Process(ctx, update); err != nil {
+	if _, err := s.service.Process(ctx, update); err != nil {
 		t.Fatalf("Process update: %v", err)
 	}
 
@@ -244,7 +267,7 @@ func TestServiceProcessDeleteRemovesFromBothStores(t *testing.T) {
 	ctx := context.Background()
 
 	row := documentRow(testDocumentID, "Doomed", "Body.", 1)
-	if err := s.service.Process(ctx, parse(t, debeziumEvent("c", "null", row))); err != nil {
+	if _, err := s.service.Process(ctx, parse(t, debeziumEvent("c", "null", row))); err != nil {
 		t.Fatalf("Process create: %v", err)
 	}
 
@@ -252,7 +275,7 @@ func TestServiceProcessDeleteRemovesFromBothStores(t *testing.T) {
 	if del.ID != testDocumentID {
 		t.Fatalf("delete event ID = %q, want the id from the before row", del.ID)
 	}
-	if err := s.service.Process(ctx, del); err != nil {
+	if _, err := s.service.Process(ctx, del); err != nil {
 		t.Fatalf("Process delete: %v", err)
 	}
 
@@ -273,11 +296,11 @@ func TestServiceProcessSnapshotReadIndexesLikeACreate(t *testing.T) {
 	row := documentRow(testDocumentID, "Backfilled", "From the initial snapshot.", 1)
 
 	read := newTestService(t)
-	if err := read.service.Process(context.Background(), parse(t, debeziumEvent("r", "null", row))); err != nil {
+	if _, err := read.service.Process(context.Background(), parse(t, debeziumEvent("r", "null", row))); err != nil {
 		t.Fatalf("Process snapshot read: %v", err)
 	}
 	create := newTestService(t)
-	if err := create.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", row))); err != nil {
+	if _, err := create.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", row))); err != nil {
 		t.Fatalf("Process create: %v", err)
 	}
 
@@ -302,7 +325,7 @@ func TestServiceProcessIsIdempotent(t *testing.T) {
 	ev := parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "Once", "Only once.", 1)))
 
 	for i := range 5 {
-		if err := s.service.Process(ctx, ev); err != nil {
+		if _, err := s.service.Process(ctx, ev); err != nil {
 			t.Fatalf("Process %d: %v", i+1, err)
 		}
 	}
@@ -322,7 +345,7 @@ func TestServiceProcessIsIdempotent(t *testing.T) {
 	// Deleting twice is also harmless.
 	del := parse(t, debeziumEvent("d", documentRow(testDocumentID, "Once", "Only once.", 1), "null"))
 	for i := range 2 {
-		if err := s.service.Process(ctx, del); err != nil {
+		if _, err := s.service.Process(ctx, del); err != nil {
 			t.Fatalf("Process delete %d: %v", i+1, err)
 		}
 	}
@@ -338,11 +361,11 @@ func TestServiceProcessCarriesTheRowVersion(t *testing.T) {
 	ctx := context.Background()
 
 	newer := parse(t, debeziumEvent("u", "null", documentRow(testDocumentID, "Newer", "Newer body.", 9)))
-	if err := s.service.Process(ctx, newer); err != nil {
+	if _, err := s.service.Process(ctx, newer); err != nil {
 		t.Fatalf("Process newer: %v", err)
 	}
 	stale := parse(t, debeziumEvent("u", "null", documentRow(testDocumentID, "Older", "Older body.", 4)))
-	if err := s.service.Process(ctx, stale); err != nil {
+	if _, err := s.service.Process(ctx, stale); err != nil {
 		t.Fatalf("Process stale: %v", err)
 	}
 
@@ -382,7 +405,7 @@ func TestServiceProcessRejectsInvalidEvents(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newTestService(t)
-			err := s.service.Process(context.Background(), tt.event)
+			_, err := s.service.Process(context.Background(), tt.event)
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
 			}
@@ -402,7 +425,7 @@ func TestServiceProcessReportsKeywordFailure(t *testing.T) {
 	want := errors.New("opensearch unavailable")
 	s.keyword.indexErr = want
 
-	err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
+	_, err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want it to wrap %v", err, want)
 	}
@@ -428,7 +451,7 @@ func TestServiceProcessReportsVectorFailure(t *testing.T) {
 	want := errors.New("qdrant unavailable")
 	s.vectors.upsertErr = want
 
-	err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
+	_, err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
 	if err == nil {
 		t.Fatal("Process returned nil although the vector index rejected the write")
 	}
@@ -450,7 +473,7 @@ func TestServiceProcessReportsVectorFailure(t *testing.T) {
 	}
 
 	s.vectors.upsertErr = nil
-	if err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1)))); err != nil {
+	if _, err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1)))); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if s.keyword.count() != 1 || s.vectors.count() != 1 {
@@ -467,7 +490,7 @@ func TestServiceProcessReportsEmbedderFailure(t *testing.T) {
 	want := errors.New("embedding api rate limited")
 	s.embedder.err = want
 
-	err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
+	_, err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want it to wrap %v", err, want)
 	}
@@ -488,7 +511,7 @@ func TestServiceProcessReportsEmbedderFailure(t *testing.T) {
 	s.embedder.mu.Lock()
 	s.embedder.err = nil
 	s.embedder.mu.Unlock()
-	if err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1)))); err != nil {
+	if _, err := s.service.Process(context.Background(), parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1)))); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if s.keyword.count() != 1 || s.vectors.count() != 1 {
@@ -519,7 +542,7 @@ func TestServiceProcessDeleteAsksBothStoresDespiteFailure(t *testing.T) {
 			s.vectors.deleteErr = tt.vectorErr
 
 			del := parse(t, debeziumEvent("d", documentRow(testDocumentID, "T", "B", 1), "null"))
-			err := s.service.Process(context.Background(), del)
+			_, err := s.service.Process(context.Background(), del)
 			if err == nil {
 				t.Fatal("Process returned nil although a delete failed")
 			}
@@ -543,7 +566,7 @@ func TestServiceProcessStopsOnCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := s.service.Process(ctx, parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
+	_, err := s.service.Process(ctx, parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "T", "B", 1))))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -572,7 +595,7 @@ func TestServiceProcessIsSafeForConcurrentUse(t *testing.T) {
 					Table:     "documents",
 					Row:       map[string]any{"title": id, "body": fmt.Sprintf("body %d", r)},
 				}
-				if err := s.service.Process(context.Background(), ev); err != nil {
+				if _, err := s.service.Process(context.Background(), ev); err != nil {
 					t.Errorf("Process: %v", err)
 				}
 			}()
@@ -630,10 +653,158 @@ func TestEmbedderFuncAdaptsAFunction(t *testing.T) {
 		t.Fatalf("NewService: %v", err)
 	}
 	ev := parse(t, debeziumEvent("c", "null", documentRow(testDocumentID, "Title", "Body.", 1)))
-	if err := service.Process(context.Background(), ev); err != nil {
+	if _, err := service.Process(context.Background(), ev); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if want := "title: Title | text: Body."; got != want {
 		t.Fatalf("embedded text = %q, want %q", got, want)
+	}
+}
+
+// An event the indexes have already moved past must not be written anywhere,
+// not even to the stores that have no version check of their own. OpenSearch
+// refuses it; the service has to stop there rather than embed the old row and
+// push it into Qdrant.
+func TestServiceProcessSkipsStaleEvents(t *testing.T) {
+	s := newTestService(t)
+	ctx := context.Background()
+
+	newer := parse(t, debeziumEventAt("u", "null", documentRow(testDocumentID, "Newer", "Newer body.", 9), 200))
+	if _, err := s.service.Process(ctx, newer); err != nil {
+		t.Fatalf("Process newer: %v", err)
+	}
+	embedsAfterNewer := len(s.embedder.calls())
+	upsertsAfterNewer := s.vectors.upsertCalls
+
+	// The same row as it was four versions ago, redelivered late.
+	stale := parse(t, debeziumEventAt("u", "null", documentRow(testDocumentID, "Older", "Older body.", 4), 100))
+	effect, err := s.service.Process(ctx, stale)
+	if err != nil {
+		t.Fatalf("Process stale: %v", err)
+	}
+
+	if effect != EffectStale {
+		t.Errorf("effect = %q, want %q", effect, EffectStale)
+	}
+	if got := len(s.embedder.calls()); got != embedsAfterNewer {
+		t.Errorf("%d embed calls after the stale event, want %d: embedding an overtaken row is wasted work",
+			got, embedsAfterNewer)
+	}
+	if s.vectors.upsertCalls != upsertsAfterNewer {
+		t.Errorf("the stale event wrote to the vector index, replacing a newer vector")
+	}
+
+	doc, _ := s.keyword.document(testDocumentID)
+	if doc.Version != 9 || doc.Title != "Newer" {
+		t.Errorf("document = %+v, want the version 9 row", doc)
+	}
+	point, ok := s.vectors.point(testDocumentID)
+	if !ok {
+		t.Fatal("the point is gone")
+	}
+	if version, _ := point.Payload["version"].(int64); version != 9 {
+		t.Errorf("point payload version = %v, want 9: the vector index kept the older row", point.Payload["version"])
+	}
+}
+
+// What an event did has to be reported, because a redelivery and a first
+// delivery leave the same state behind and are only distinguishable here.
+func TestServiceProcessReportsWhatItDid(t *testing.T) {
+	s := newTestService(t)
+	ctx := context.Background()
+
+	create := parse(t, debeziumEventAt("c", "null", documentRow(testDocumentID, "T", "B", 5), 100))
+	if effect, err := s.service.Process(ctx, create); err != nil || effect != EffectIndexed {
+		t.Fatalf("create = %q, %v; want %q", effect, err, EffectIndexed)
+	}
+	// The same event again, as Kafka delivers it after a crash before the
+	// offset was committed.
+	if effect, err := s.service.Process(ctx, create); err != nil || effect != EffectReapplied {
+		t.Fatalf("redelivery = %q, %v; want %q", effect, err, EffectReapplied)
+	}
+	older := parse(t, debeziumEventAt("u", "null", documentRow(testDocumentID, "Old", "B", 2), 50))
+	if effect, err := s.service.Process(ctx, older); err != nil || effect != EffectStale {
+		t.Fatalf("stale = %q, %v; want %q", effect, err, EffectStale)
+	}
+	newer := parse(t, debeziumEventAt("u", "null", documentRow(testDocumentID, "New", "B", 6), 150))
+	if effect, err := s.service.Process(ctx, newer); err != nil || effect != EffectIndexed {
+		t.Fatalf("update = %q, %v; want %q", effect, err, EffectIndexed)
+	}
+	del := parse(t, debeziumEventAt("d", documentRow(testDocumentID, "New", "B", 6), "null", 160))
+	if effect, err := s.service.Process(ctx, del); err != nil || effect != EffectDeleted {
+		t.Fatalf("delete = %q, %v; want %q", effect, err, EffectDeleted)
+	}
+	// A delete of something already gone is still a delete, not an error.
+	if effect, err := s.service.Process(ctx, del); err != nil || effect != EffectDeleted {
+		t.Fatalf("repeated delete = %q, %v; want %q", effect, err, EffectDeleted)
+	}
+
+	if s.keyword.count() != 0 || s.vectors.count() != 0 {
+		t.Errorf("stores hold %d documents and %d points, want both empty", s.keyword.count(), s.vectors.count())
+	}
+}
+
+// Each store can fail on its own, and the event is then re-processed. Whatever
+// order the failures come in, the indexes end up holding one document and one
+// point, with the newest row in both.
+func TestServiceConvergesAfterPartialFailures(t *testing.T) {
+	unavailable := errors.New("store unavailable")
+	create := func(version int) ChangeEvent {
+		return parse(t, debeziumEventAt("c", "null", documentRow(testDocumentID, "Title", "Body.", version), int64(version*10)))
+	}
+
+	tests := []struct {
+		name string
+		fail func(s testStores)
+		heal func(s testStores)
+	}{
+		{
+			name: "the keyword index is down first",
+			fail: func(s testStores) { s.keyword.failIndexes(unavailable) },
+			heal: func(s testStores) { s.keyword.failIndexes(nil) },
+		},
+		{
+			name: "the vector index is down first",
+			fail: func(s testStores) { s.vectors.failUpserts(unavailable) },
+			heal: func(s testStores) { s.vectors.failUpserts(nil) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestService(t)
+			ctx := context.Background()
+			ev := create(3)
+
+			tt.fail(s)
+			if _, err := s.service.Process(ctx, ev); err == nil {
+				t.Fatal("Process returned nil although a store was down")
+			}
+			tt.heal(s)
+
+			// The retry is the same event again: it must finish the work the
+			// first attempt left undone, not skip it as a duplicate.
+			if _, err := s.service.Process(ctx, ev); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if s.keyword.count() != 1 || s.vectors.count() != 1 {
+				t.Fatalf("after the retry: %d documents, %d points; want 1 and 1", s.keyword.count(), s.vectors.count())
+			}
+
+			// A later change still applies on top of the recovered state.
+			if _, err := s.service.Process(ctx, create(4)); err != nil {
+				t.Fatalf("later change: %v", err)
+			}
+			doc, _ := s.keyword.document(testDocumentID)
+			point, _ := s.vectors.point(testDocumentID)
+			if doc.Version != 4 {
+				t.Errorf("document version = %d, want 4", doc.Version)
+			}
+			if version, _ := point.Payload["version"].(int64); version != 4 {
+				t.Errorf("point payload version = %v, want 4", point.Payload["version"])
+			}
+			if s.keyword.count() != 1 || s.vectors.count() != 1 {
+				t.Errorf("stores hold %d documents and %d points, want 1 and 1", s.keyword.count(), s.vectors.count())
+			}
+		})
 	}
 }

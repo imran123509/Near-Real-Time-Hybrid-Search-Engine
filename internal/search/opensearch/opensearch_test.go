@@ -272,8 +272,12 @@ func TestIndexDocument(t *testing.T) {
 
 	t.Run("uses the document id as the OpenSearch id", func(t *testing.T) {
 		c, fake := newTestClient(t, func(request) (int, string) { return http.StatusCreated, `{"result":"created"}` })
-		if err := c.IndexDocument(context.Background(), doc); err != nil {
+		result, err := c.IndexDocument(context.Background(), doc)
+		if err != nil {
 			t.Fatal(err)
+		}
+		if result != WriteApplied {
+			t.Errorf("result = %s, want applied", result)
 		}
 		got := fake.seen()[0]
 		if got.Method != http.MethodPut || got.Path != "/documents/_doc/7f1c9b2e" {
@@ -292,7 +296,7 @@ func TestIndexDocument(t *testing.T) {
 		c, fake := newTestClient(t, func(request) (int, string) { return http.StatusOK, `{"result":"updated"}` })
 		versioned := doc
 		versioned.Version = 42
-		if err := c.IndexDocument(context.Background(), versioned); err != nil {
+		if _, err := c.IndexDocument(context.Background(), versioned); err != nil {
 			t.Fatal(err)
 		}
 		if q := fake.seen()[0].Query; !strings.Contains(q, "version=42") || !strings.Contains(q, "version_type=external") {
@@ -300,14 +304,89 @@ func TestIndexDocument(t *testing.T) {
 		}
 	})
 
-	t.Run("stale version is ignored", func(t *testing.T) {
-		c, _ := newTestClient(t, func(request) (int, string) {
-			return http.StatusConflict, `{"error":{"type":"version_conflict_engine_exception","reason":"conflict"},"status":409}`
+	// A refused versioned write is not a failure, but the two reasons for it
+	// mean very different things to the caller, and OpenSearch reports both
+	// as 409. The stored version is what tells them apart.
+	t.Run("a refused write reports whether the event is stale", func(t *testing.T) {
+		const conflict = `{"error":{"type":"version_conflict_engine_exception","reason":"conflict"},"status":409}`
+
+		tests := []struct {
+			name       string
+			getStatus  int
+			getBody    string
+			want       WriteResult
+			wantLookup bool
+		}{
+			{
+				name: "the index holds a newer version", getStatus: http.StatusOK,
+				getBody: `{"_id":"7f1c9b2e","_version":9,"found":true}`, want: WriteStale, wantLookup: true,
+			},
+			{
+				name: "the index holds this same version", getStatus: http.StatusOK,
+				getBody: `{"_id":"7f1c9b2e","_version":3,"found":true}`, want: WriteDuplicate, wantLookup: true,
+			},
+			{
+				// A delete overtook this event between the two requests.
+				name: "the document is gone", getStatus: http.StatusNotFound,
+				getBody: `{"_id":"7f1c9b2e","found":false}`, want: WriteStale, wantLookup: true,
+			},
+			{
+				// Assuming "stale" here could leave the document out of the
+				// vector index for good; repeating the write cannot.
+				name: "the version cannot be read", getStatus: http.StatusServiceUnavailable,
+				getBody: `{"error":{"type":"unavailable"},"status":503}`, want: WriteDuplicate, wantLookup: true,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				c, fake := newTestClient(t, func(r request) (int, string) {
+					if r.Method == http.MethodGet {
+						return tt.getStatus, tt.getBody
+					}
+					return http.StatusConflict, conflict
+				})
+
+				stale := doc
+				stale.Version = 3
+				result, err := c.IndexDocument(context.Background(), stale)
+				if err != nil {
+					t.Fatalf("a refused versioned write should not be an error, got %v", err)
+				}
+				if result != tt.want {
+					t.Errorf("result = %s, want %s", result, tt.want)
+				}
+
+				// The client retries a 5xx on its own, so count lookups
+				// rather than expecting exactly one request each.
+				seen := fake.seen()
+				lookups := 0
+				for _, r := range seen[1:] {
+					if r.Method != http.MethodGet {
+						t.Fatalf("unexpected request after the refused write: %+v", r)
+					}
+					lookups++
+					if !strings.Contains(r.Query, "_source=false") {
+						t.Errorf("version lookup fetched the document body: %q", r.Query)
+					}
+				}
+				if (lookups > 0) != tt.wantLookup {
+					t.Errorf("%d version lookups, want any: %v", lookups, tt.wantLookup)
+				}
+			})
+		}
+	})
+
+	// Without a version there is nothing to compare, so every write wins and
+	// no lookup is made.
+	t.Run("an unversioned conflict is an error", func(t *testing.T) {
+		c, fake := newTestClient(t, func(request) (int, string) {
+			return http.StatusConflict, `{"error":{"type":"version_conflict_engine_exception"},"status":409}`
 		})
-		stale := doc
-		stale.Version = 3
-		if err := c.IndexDocument(context.Background(), stale); err != nil {
-			t.Fatalf("stale write should be a no-op, got %v", err)
+		if _, err := c.IndexDocument(context.Background(), doc); err == nil {
+			t.Fatal("expected an error for a conflict on an unversioned write")
+		}
+		if n := len(fake.seen()); n != 1 {
+			t.Errorf("%d requests sent, want 1: there is no version to look up", n)
 		}
 	})
 
@@ -315,7 +394,7 @@ func TestIndexDocument(t *testing.T) {
 		c, _ := newTestClient(t, func(request) (int, string) {
 			return http.StatusBadRequest, `{"error":{"type":"strict_dynamic_mapping_exception","reason":"unknown field"},"status":400}`
 		})
-		err := c.IndexDocument(context.Background(), doc)
+		_, err := c.IndexDocument(context.Background(), doc)
 		var reqErr *RequestError
 		if !errors.As(err, &reqErr) || reqErr.StatusCode != http.StatusBadRequest || reqErr.Temporary() {
 			t.Fatalf("err = %v, want a non-temporary RequestError with status 400", err)
@@ -330,12 +409,50 @@ func TestIndexDocument(t *testing.T) {
 		for _, id := range []string{"", "   ", strings.Repeat("x", maxIDBytes+1)} {
 			bad := doc
 			bad.ID = id
-			if err := c.IndexDocument(context.Background(), bad); !errors.Is(err, ErrInvalidDocument) {
+			if _, err := c.IndexDocument(context.Background(), bad); !errors.Is(err, ErrInvalidDocument) {
 				t.Errorf("id of %d bytes: err = %v, want ErrInvalidDocument", len(id), err)
 			}
 		}
 		if n := len(fake.seen()); n != 0 {
 			t.Errorf("%d requests sent for invalid documents, want 0", n)
+		}
+	})
+}
+
+func TestDocumentVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantVersion int64
+		wantFound   bool
+		wantErr     bool
+	}{
+		{"indexed document", http.StatusOK, `{"_id":"doc-1","_version":7,"found":true}`, 7, true, false},
+		{"unknown document", http.StatusNotFound, `{"_id":"doc-1","found":false}`, 0, false, false},
+		{"cluster error", http.StatusServiceUnavailable, `{"error":{"type":"unavailable"},"status":503}`, 0, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := newTestClient(t, func(request) (int, string) { return tt.status, tt.body })
+
+			version, found, err := c.DocumentVersion(context.Background(), "doc-1")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if version != tt.wantVersion || found != tt.wantFound {
+				t.Errorf("version = %d, found = %v; want %d, %v", version, found, tt.wantVersion, tt.wantFound)
+			}
+		})
+	}
+
+	t.Run("invalid ids are rejected before sending", func(t *testing.T) {
+		c, fake := newTestClient(t, ok)
+		if _, _, err := c.DocumentVersion(context.Background(), " "); !errors.Is(err, ErrInvalidDocument) {
+			t.Errorf("err = %v, want ErrInvalidDocument", err)
+		}
+		if n := len(fake.seen()); n != 0 {
+			t.Errorf("%d requests sent for an invalid id, want 0", n)
 		}
 	})
 }

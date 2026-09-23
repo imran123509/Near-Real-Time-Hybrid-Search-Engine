@@ -1,0 +1,32 @@
+{
+  "before": null,
+  "after": {
+    "id": "0b7d4f6e-3c1a-4e2b-9f5d-1a2b3c4d5e03",
+    "title": "Go Concurrency Patterns",
+    "body": "Goroutines are lightweight threads managed by the Go runtime.",
+    "version": 3,
+    "updated_at": "2026-09-22T08:00:00.123456Z",
+    "url": "https://example.com/articles/go-concurrency"
+  },
+  "source": {
+    "version": "3.6.3.Final",
+    "connector": "postgresql",
+    "name": "search",
+    "ts_ms": 1790064000123,
+    "snapshot": "true",
+    "db": "searchdb",
+    "sequence": "[null,\"24023352\"]",
+    "ts_us": 1790064000123456,
+    "ts_ns": 1790064000123456000,
+    "schema": "public",
+    "table": "documents",
+    "txId": 752,
+    "lsn": 24023352,
+    "xmin": null
+  },
+  "transaction": null,
+  "op": "r",
+  "ts_ms": 1790064000456,
+  "ts_us": 1790064000456789,
+  "ts_ns": 1790064000456789000
+}

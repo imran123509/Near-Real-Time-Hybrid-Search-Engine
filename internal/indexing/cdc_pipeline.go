@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 
+	"near-real-time-hybrid-search-engine/internal/dlq"
 	"near-real-time-hybrid-search-engine/internal/indexing/cdc"
+	"near-real-time-hybrid-search-engine/internal/retry"
 )
 
 // This file joins the change-data-capture path to the machinery this package
@@ -24,11 +26,14 @@ import (
 // own events. Give its Process method to a WorkerPool as the handler.
 func NewCDCPipeline(
 	service *cdc.Service,
-	deadLetters DeadLetterPublisher,
-	maxAttempts int,
+	deadLetters dlq.Publisher,
+	policy retry.Policy,
 	logger *slog.Logger,
-) *Pipeline[cdc.ChangeEvent] {
-	return NewPipeline(decodeChangeEvent, changeEventIndexer{service: service}, deadLetters, maxAttempts, logger)
+) (*Pipeline[cdc.ChangeEvent], error) {
+	if service == nil {
+		return nil, errors.New("cdc pipeline: service is required")
+	}
+	return NewPipeline(decodeChangeEvent, changeEventIndexer{service: service}, deadLetters, policy, logger)
 }
 
 // decodeChangeEvent parses a Debezium message value.
@@ -51,8 +56,9 @@ type changeEventIndexer struct {
 	service *cdc.Service
 }
 
-func (i changeEventIndexer) Index(ctx context.Context, ev cdc.ChangeEvent) error {
-	return classifyChange(i.service.Process(ctx, ev))
+func (i changeEventIndexer) Index(ctx context.Context, ev cdc.ChangeEvent) (cdc.Effect, error) {
+	effect, err := i.service.Process(ctx, ev)
+	return effect, classifyChange(err)
 }
 
 // classifyChange marks the failures of a change event that retrying cannot fix

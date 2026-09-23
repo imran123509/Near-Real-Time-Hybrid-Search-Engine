@@ -6,6 +6,8 @@ package config
 import (
 	"errors"
 	"fmt"
+	"log/slog"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -15,9 +17,9 @@ import (
 )
 
 // Config is the full set of settings for both services. Each service reads
-// only the groups it needs: the API uses App, Server, PostgreSQL, OpenSearch
-// and Qdrant; the consumer uses App, Kafka, Indexing, PostgreSQL, OpenSearch,
-// Qdrant and Embedding.
+// only the groups it needs: the API uses App, Server, PostgreSQL, OpenSearch,
+// Qdrant, Embedding and Search; the consumer uses App, Kafka, Indexing,
+// PostgreSQL, OpenSearch, Qdrant and Embedding.
 type Config struct {
 	App        AppConfig
 	Server     ServerConfig
@@ -27,12 +29,19 @@ type Config struct {
 	Qdrant     QdrantConfig
 	Indexing   IndexingConfig
 	Embedding  EmbeddingConfig
+	Search     SearchConfig
 }
 
 // AppConfig identifies the running service.
 type AppConfig struct {
 	Env  string // APP_ENV
 	Name string // APP_NAME
+	// StartupTimeout is how long a service waits for its dependencies to
+	// accept connections before giving up. Each is retried with backoff until
+	// then, so services tolerate starting before their dependencies.
+	StartupTimeout time.Duration // APP_STARTUP_TIMEOUT
+	// LogLevel is the lowest level logged: debug, info, warn or error.
+	LogLevel slog.Level // LOG_LEVEL
 }
 
 // ServerConfig holds HTTP server settings for the API.
@@ -72,6 +81,30 @@ type KafkaConfig struct {
 	ConsumerGroup string   // KAFKA_CONSUMER_GROUP
 	DLQTopic      string   // KAFKA_DLQ_TOPIC, defaults to Topic + ".dlq"
 	Workers       int      // KAFKA_WORKERS
+	Retry         RetryConfig
+}
+
+// RetryConfig decides how often and how far apart a failed message is retried
+// before it is sent to the dead-letter topic.
+//
+// The delay before attempt n is InitialBackoff × Multiplier^(n-1), never more
+// than MaxBackoff. With the defaults that is 500ms, 1s, 2s, ... up to 30s.
+//
+// The values trade recovery against lag: a store that is restarting usually
+// comes back within seconds, so a few attempts spread over tens of seconds
+// recover most failures, while the worker handling the message is blocked for
+// that whole time and its partition falls further behind. Raising MaxAttempts
+// or MaxBackoff buys patience with lag.
+type RetryConfig struct {
+	// MaxAttempts is the total number of tries per message, the first one
+	// included, so 1 disables retrying.
+	MaxAttempts int // KAFKA_RETRY_MAX_ATTEMPTS
+	// InitialBackoff is the wait before the second attempt.
+	InitialBackoff time.Duration // KAFKA_RETRY_INITIAL_BACKOFF
+	// MaxBackoff caps the wait however many attempts have failed.
+	MaxBackoff time.Duration // KAFKA_RETRY_MAX_BACKOFF
+	// Multiplier is how much each wait grows; 1 keeps it constant.
+	Multiplier float64 // KAFKA_RETRY_MULTIPLIER
 }
 
 // OpenSearchConfig holds OpenSearch connection settings. Password is a secret,
@@ -103,14 +136,12 @@ type QdrantConfig struct {
 	UseTLS bool
 }
 
-// IndexingConfig holds worker pool and retry settings for the consumer.
+// IndexingConfig holds worker pool settings for the consumer. How a failed
+// message is retried is KafkaConfig.Retry.
 type IndexingConfig struct {
 	Workers   int // INDEXING_WORKERS
 	QueueSize int // INDEXING_QUEUE_SIZE, buffered messages across all workers
 	BatchSize int // INDEXING_BATCH_SIZE
-	// RetryAttempts is the total number of tries per message, including the
-	// first one.
-	RetryAttempts int // INDEXING_RETRY_ATTEMPTS
 }
 
 // EmbeddingConfig selects and configures the provider that turns text into
@@ -133,20 +164,42 @@ type EmbeddingConfig struct {
 	Timeout time.Duration // EMBEDDING_TIMEOUT
 }
 
+// SearchConfig holds hybrid search settings for the API.
+type SearchConfig struct {
+	// DefaultLimit is the number of results returned when a request does not
+	// ask for a specific number.
+	DefaultLimit int // SEARCH_DEFAULT_LIMIT
+	// MaxLimit is the most results one request may ask for.
+	MaxLimit int // SEARCH_MAX_LIMIT
+	// CandidateLimit is how many results are fetched from each retriever
+	// before fusion. Fusing only the final page from each would drop documents
+	// that rank moderately in both lists, which is exactly what RRF rewards.
+	CandidateLimit int // SEARCH_CANDIDATE_LIMIT
+	// RRFK is the Reciprocal Rank Fusion constant; the default is rrf.DefaultK.
+	RRFK int // RRF_K
+	// Timeout bounds one search request, all dependency calls included. It
+	// must be shorter than HTTP_WRITE_TIMEOUT so that a timed-out search can
+	// still be answered with an error instead of a dropped connection.
+	Timeout time.Duration // SEARCH_TIMEOUT
+}
+
 // Load reads the environment, applies defaults, parses values and validates
 // them. It reports every problem it finds rather than only the first, and
 // never logs secrets.
 //
 // Required: DATABASE_URL, KAFKA_BROKERS, KAFKA_TOPIC, KAFKA_CONSUMER_GROUP,
-// OPENSEARCH_URL, QDRANT_URL. The consumer additionally needs
-// EMBEDDING_API_KEY, which the embedding provider checks when it is created.
+// OPENSEARCH_URL, QDRANT_URL. Both services also need EMBEDDING_API_KEY: the
+// consumer embeds documents and the API embeds queries. The embedding provider
+// checks it when it is created.
 func Load() (Config, error) {
 	var e env
 
 	cfg := Config{
 		App: AppConfig{
-			Env:  getEnv("APP_ENV", "development"),
-			Name: getEnv("APP_NAME", "near-realtime-search"),
+			Env:            getEnv("APP_ENV", "development"),
+			Name:           getEnv("APP_NAME", "near-realtime-search"),
+			StartupTimeout: e.duration("APP_STARTUP_TIMEOUT", 60*time.Second),
+			LogLevel:       e.logLevel("LOG_LEVEL", slog.LevelInfo),
 		},
 		Server: ServerConfig{
 			Host:            getEnv("HTTP_HOST", "0.0.0.0"),
@@ -170,6 +223,12 @@ func Load() (Config, error) {
 			Topic:         e.required("KAFKA_TOPIC"),
 			ConsumerGroup: e.required("KAFKA_CONSUMER_GROUP"),
 			Workers:       e.int("KAFKA_WORKERS", 10),
+			Retry: RetryConfig{
+				MaxAttempts:    e.int("KAFKA_RETRY_MAX_ATTEMPTS", 5),
+				InitialBackoff: e.duration("KAFKA_RETRY_INITIAL_BACKOFF", 500*time.Millisecond),
+				MaxBackoff:     e.duration("KAFKA_RETRY_MAX_BACKOFF", 30*time.Second),
+				Multiplier:     e.float("KAFKA_RETRY_MULTIPLIER", 2),
+			},
 		},
 		OpenSearch: OpenSearchConfig{
 			URL:      e.required("OPENSEARCH_URL"),
@@ -183,10 +242,9 @@ func Load() (Config, error) {
 			Collection: getEnv("QDRANT_COLLECTION", "documents"),
 		},
 		Indexing: IndexingConfig{
-			Workers:       e.int("INDEXING_WORKERS", 10),
-			QueueSize:     e.int("INDEXING_QUEUE_SIZE", 1000),
-			BatchSize:     e.int("INDEXING_BATCH_SIZE", 100),
-			RetryAttempts: e.int("INDEXING_RETRY_ATTEMPTS", 3),
+			Workers:   e.int("INDEXING_WORKERS", 10),
+			QueueSize: e.int("INDEXING_QUEUE_SIZE", 1000),
+			BatchSize: e.int("INDEXING_BATCH_SIZE", 100),
 		},
 		Embedding: EmbeddingConfig{
 			Provider:  strings.ToLower(getEnv("EMBEDDING_PROVIDER", "gemini")),
@@ -194,6 +252,13 @@ func Load() (Config, error) {
 			Model:     getEnv("EMBEDDING_MODEL", "gemini-embedding-2"),
 			Dimension: e.int("EMBEDDING_DIMENSION", 768),
 			Timeout:   e.duration("EMBEDDING_TIMEOUT", 10*time.Second),
+		},
+		Search: SearchConfig{
+			DefaultLimit:   e.int("SEARCH_DEFAULT_LIMIT", 10),
+			MaxLimit:       e.int("SEARCH_MAX_LIMIT", 50),
+			CandidateLimit: e.int("SEARCH_CANDIDATE_LIMIT", 50),
+			RRFK:           e.int("RRF_K", 60),
+			Timeout:        e.duration("SEARCH_TIMEOUT", 5*time.Second),
 		},
 	}
 	cfg.Kafka.DLQTopic = getEnv("KAFKA_DLQ_TOPIC", cfg.Kafka.Topic+".dlq")
@@ -231,6 +296,7 @@ func (c Config) validate() error {
 		key   string
 		value time.Duration
 	}{
+		{"APP_STARTUP_TIMEOUT", c.App.StartupTimeout},
 		{"HTTP_READ_TIMEOUT", c.Server.ReadTimeout},
 		{"HTTP_WRITE_TIMEOUT", c.Server.WriteTimeout},
 		{"HTTP_IDLE_TIMEOUT", c.Server.IdleTimeout},
@@ -240,6 +306,9 @@ func (c Config) validate() error {
 		{"DATABASE_HEALTH_CHECK_PERIOD", c.PostgreSQL.HealthCheckPeriod},
 		{"DATABASE_CONNECT_TIMEOUT", c.PostgreSQL.ConnectTimeout},
 		{"EMBEDDING_TIMEOUT", c.Embedding.Timeout},
+		{"SEARCH_TIMEOUT", c.Search.Timeout},
+		{"KAFKA_RETRY_INITIAL_BACKOFF", c.Kafka.Retry.InitialBackoff},
+		{"KAFKA_RETRY_MAX_BACKOFF", c.Kafka.Retry.MaxBackoff},
 	} {
 		if d.value <= 0 {
 			add(fmt.Errorf("%s must be positive, got %s", d.key, d.value))
@@ -254,9 +323,13 @@ func (c Config) validate() error {
 		{"INDEXING_WORKERS", c.Indexing.Workers},
 		{"INDEXING_QUEUE_SIZE", c.Indexing.QueueSize},
 		{"INDEXING_BATCH_SIZE", c.Indexing.BatchSize},
-		{"INDEXING_RETRY_ATTEMPTS", c.Indexing.RetryAttempts},
+		{"KAFKA_RETRY_MAX_ATTEMPTS", c.Kafka.Retry.MaxAttempts},
 		{"EMBEDDING_DIMENSION", c.Embedding.Dimension},
 		{"QDRANT_VECTOR_SIZE", c.Qdrant.VectorSize},
+		{"SEARCH_DEFAULT_LIMIT", c.Search.DefaultLimit},
+		{"SEARCH_MAX_LIMIT", c.Search.MaxLimit},
+		{"SEARCH_CANDIDATE_LIMIT", c.Search.CandidateLimit},
+		{"RRF_K", c.Search.RRFK},
 	} {
 		if n.value <= 0 {
 			add(fmt.Errorf("%s must be positive, got %d", n.key, n.value))
@@ -268,6 +341,16 @@ func (c Config) validate() error {
 	if c.PostgreSQL.MinConns > c.PostgreSQL.MaxConns {
 		add(fmt.Errorf("DATABASE_MIN_CONNS (%d) must not exceed DATABASE_MAX_CONNS (%d)",
 			c.PostgreSQL.MinConns, c.PostgreSQL.MaxConns))
+	}
+	// A cap below the first wait, or a multiplier that shrinks the wait, would
+	// silently turn exponential backoff into something else, so both are
+	// refused rather than corrected.
+	if c.Kafka.Retry.MaxBackoff > 0 && c.Kafka.Retry.MaxBackoff < c.Kafka.Retry.InitialBackoff {
+		add(fmt.Errorf("KAFKA_RETRY_MAX_BACKOFF (%s) must not be shorter than KAFKA_RETRY_INITIAL_BACKOFF (%s)",
+			c.Kafka.Retry.MaxBackoff, c.Kafka.Retry.InitialBackoff))
+	}
+	if m := c.Kafka.Retry.Multiplier; m < 1 || math.IsInf(m, 0) || math.IsNaN(m) {
+		add(fmt.Errorf("KAFKA_RETRY_MULTIPLIER must be a finite number of at least 1, got %v", m))
 	}
 	add(checkURL("OPENSEARCH_URL", c.OpenSearch.URL))
 	if c.OpenSearch.Index == "" {
@@ -283,6 +366,20 @@ func (c Config) validate() error {
 	}
 	if c.Embedding.Model == "" {
 		add(errors.New("EMBEDDING_MODEL must not be empty"))
+	}
+	if c.Search.DefaultLimit > c.Search.MaxLimit {
+		add(fmt.Errorf("SEARCH_DEFAULT_LIMIT (%d) must not exceed SEARCH_MAX_LIMIT (%d)",
+			c.Search.DefaultLimit, c.Search.MaxLimit))
+	}
+	if c.Search.Timeout >= c.Server.WriteTimeout {
+		add(fmt.Errorf("SEARCH_TIMEOUT (%s) must be shorter than HTTP_WRITE_TIMEOUT (%s)",
+			c.Search.Timeout, c.Server.WriteTimeout))
+	}
+	// Each retriever must supply at least a full page, or the fused page could
+	// come up short even when both retrievers have plenty of matches.
+	if c.Search.MaxLimit > c.Search.CandidateLimit {
+		add(fmt.Errorf("SEARCH_MAX_LIMIT (%d) must not exceed SEARCH_CANDIDATE_LIMIT (%d)",
+			c.Search.MaxLimit, c.Search.CandidateLimit))
 	}
 
 	return errors.Join(errs...)
@@ -316,6 +413,25 @@ func (e *env) duration(key string, fallback time.Duration) time.Duration {
 	v, err := getEnvDuration(key, fallback)
 	e.add(err)
 	return v
+}
+
+func (e *env) float(key string, fallback float64) float64 {
+	v, err := getEnvFloat(key, fallback)
+	e.add(err)
+	return v
+}
+
+func (e *env) logLevel(key string, fallback slog.Level) slog.Level {
+	raw := getEnv(key, "")
+	if raw == "" {
+		return fallback
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(raw)); err != nil {
+		e.add(fmt.Errorf("invalid %s: want debug, info, warn or error, got %q", key, raw))
+		return fallback
+	}
+	return level
 }
 
 func (e *env) add(err error) {
@@ -356,6 +472,19 @@ func getEnvInt(key string, fallback int) (int, error) {
 		return 0, fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return n, nil
+}
+
+// getEnvFloat parses key as a decimal number. Range checks belong in validate.
+func getEnvFloat(key string, fallback float64) (float64, error) {
+	raw := getEnv(key, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return f, nil
 }
 
 // getEnvDuration parses key as a Go duration such as "10s" or "1m30s".

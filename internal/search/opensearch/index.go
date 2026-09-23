@@ -94,18 +94,56 @@ func (c *Client) indexExists(ctx context.Context) (bool, error) {
 	}
 }
 
+// WriteResult says what an index write did, so a caller can tell a first
+// write from a replay, and both from an event the index has already moved
+// past. It is what makes a duplicate delivery distinguishable from stale data
+// without keeping a record of processed events anywhere.
+type WriteResult int
+
+const (
+	// WriteUnknown means nothing is known about the write, which is what is
+	// returned with every error.
+	WriteUnknown WriteResult = iota
+	// WriteApplied means the index now holds this document.
+	WriteApplied
+	// WriteDuplicate means the index already held exactly this version, so
+	// the write changed nothing. The event is not out of date: an earlier
+	// attempt may have stopped right after this step, so the caller should
+	// carry on with whatever else the event requires.
+	WriteDuplicate
+	// WriteStale means the index holds a newer version of the document. The
+	// event has been overtaken, and its data must not be written to any
+	// other store either.
+	WriteStale
+)
+
+func (r WriteResult) String() string {
+	switch r {
+	case WriteApplied:
+		return "applied"
+	case WriteDuplicate:
+		return "duplicate"
+	case WriteStale:
+		return "stale"
+	default:
+		return "unknown"
+	}
+}
+
 // IndexDocument creates or replaces the document stored under doc.ID.
 //
 // The OpenSearch _id is doc.ID itself, so indexing the same document again
-// replaces it rather than adding a copy. When doc.Version is positive, a write
-// with an older or equal version is ignored and IndexDocument returns nil.
-func (c *Client) IndexDocument(ctx context.Context, doc Document) error {
+// replaces it rather than adding a copy. When doc.Version is positive the
+// write is conditional: OpenSearch refuses one whose version is not higher
+// than the stored version, and IndexDocument reports that as WriteDuplicate or
+// WriteStale instead of an error.
+func (c *Client) IndexDocument(ctx context.Context, doc Document) (WriteResult, error) {
 	if err := validateID(doc.ID); err != nil {
-		return err
+		return WriteUnknown, err
 	}
 	body, err := json.Marshal(doc)
 	if err != nil {
-		return fmt.Errorf("%w: encode %s: %w", ErrInvalidDocument, doc.ID, err)
+		return WriteUnknown, fmt.Errorf("%w: encode %s: %w", ErrInvalidDocument, doc.ID, err)
 	}
 
 	req := opensearchapi.IndexReq{
@@ -120,13 +158,69 @@ func (c *Client) IndexDocument(ctx context.Context, doc Document) error {
 
 	resp, err := c.api.Index(ctx, req)
 	if err == nil {
-		return nil
+		return WriteApplied, nil
 	}
 	code := statusCode(resp.Inspect().Response)
 	if doc.Version > 0 && code == http.StatusConflict {
-		return nil // the index already holds this version or a newer one
+		return c.classifyConflict(ctx, doc), nil
 	}
-	return fmt.Errorf("index document %s: %w", doc.ID, &RequestError{StatusCode: code, Err: err})
+	return WriteUnknown, fmt.Errorf("index document %s: %w", doc.ID, &RequestError{StatusCode: code, Err: err})
+}
+
+// classifyConflict works out what a refused versioned write means.
+//
+// OpenSearch answers 409 both when the stored version equals the one offered
+// and when it is higher, and its message is the only thing that tells them
+// apart. Rather than reading error text, the stored version is read back and
+// compared; that costs one request, and only on the replays and late events
+// that produce a conflict in the first place.
+//
+// When the version cannot be read, the conflict counts as a duplicate. That
+// is the assumption that cannot lose data: repeating the caller's remaining
+// writes is harmless because they are idempotent, while wrongly calling an
+// event stale would leave the document out of the other index.
+func (c *Client) classifyConflict(ctx context.Context, doc Document) WriteResult {
+	version, found, err := c.DocumentVersion(ctx, doc.ID)
+	switch {
+	case err != nil:
+		return WriteDuplicate
+	case !found:
+		// The document was deleted between the refused write and this read,
+		// so something newer than this event has already been applied.
+		return WriteStale
+	case version > doc.Version:
+		return WriteStale
+	default:
+		return WriteDuplicate
+	}
+}
+
+// DocumentVersion returns the version the index holds for id, and whether the
+// document exists at all. The document body is not fetched.
+//
+// For documents written with a positive Document.Version this is that same
+// external version, so it can be compared with an incoming event's version
+// directly.
+func (c *Client) DocumentVersion(ctx context.Context, id string) (version int64, found bool, err error) {
+	if err := validateID(id); err != nil {
+		return 0, false, err
+	}
+	resp, err := c.api.Document.Get(ctx, opensearchapi.DocumentGetReq{
+		Index:      c.index,
+		DocumentID: id,
+		Params:     opensearchapi.DocumentGetParams{Source: false},
+	})
+	if err != nil {
+		code := statusCode(resp.Inspect().Response)
+		if code == http.StatusNotFound {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("read version of document %s: %w", id, &RequestError{StatusCode: code, Err: err})
+	}
+	if !resp.Found {
+		return 0, false, nil
+	}
+	return int64(resp.Version), true, nil
 }
 
 // DeleteDocument removes the document stored under id. Deleting a document

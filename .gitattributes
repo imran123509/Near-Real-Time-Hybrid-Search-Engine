@@ -1,0 +1,7 @@
+# Files executed inside Linux containers must keep LF line endings. On Windows,
+# Git's autocrlf would otherwise check them out with CRLF, and bash then fails
+# on the stray carriage returns ("\r: command not found").
+*.sh    text eol=lf
+*.sql   text eol=lf
+*.json  text eol=lf
+Dockerfile text eol=lf

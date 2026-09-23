@@ -77,12 +77,12 @@ func TestIntegrationIndexSearchDelete(t *testing.T) {
 		{ID: "doc-2", Title: "Postgres indexes", Content: "B-tree indexes speed up lookups in Go services.", UpdatedAt: time.Now().UTC()},
 	}
 	for _, d := range docs {
-		if err := c.IndexDocument(ctx, d); err != nil {
+		if _, err := c.IndexDocument(ctx, d); err != nil {
 			t.Fatalf("IndexDocument %s: %v", d.ID, err)
 		}
 	}
 	// Indexing the same ID again replaces the document instead of duplicating it.
-	if err := c.IndexDocument(ctx, docs[0]); err != nil {
+	if _, err := c.IndexDocument(ctx, docs[0]); err != nil {
 		t.Fatalf("re-index: %v", err)
 	}
 	refresh(t, ctx, c)
@@ -123,11 +123,21 @@ func TestIntegrationStaleVersionIsIgnored(t *testing.T) {
 	newer := Document{ID: "doc-v", Title: "new title", Content: "current", Version: 5}
 	older := Document{ID: "doc-v", Title: "old title", Content: "stale", Version: 4}
 
-	if err := c.IndexDocument(ctx, newer); err != nil {
-		t.Fatalf("index v5: %v", err)
+	if result, err := c.IndexDocument(ctx, newer); err != nil || result != WriteApplied {
+		t.Fatalf("index v5 = %s, %v; want applied", result, err)
 	}
-	if err := c.IndexDocument(ctx, older); err != nil {
-		t.Fatalf("index v4 should be a no-op, got %v", err)
+	// An event the index has moved past: it must be refused, and the caller
+	// must be told, so it does not go on to write the stale vector.
+	if result, err := c.IndexDocument(ctx, older); err != nil || result != WriteStale {
+		t.Fatalf("index v4 = %s, %v; want stale", result, err)
+	}
+	// The same event again is a duplicate, not stale: an earlier attempt may
+	// have failed after this write, so the caller must finish its work.
+	if result, err := c.IndexDocument(ctx, newer); err != nil || result != WriteDuplicate {
+		t.Fatalf("re-index v5 = %s, %v; want duplicate", result, err)
+	}
+	if version, found, err := c.DocumentVersion(ctx, newer.ID); err != nil || !found || version != 5 {
+		t.Fatalf("DocumentVersion = %d, %v, %v; want 5, true, nil", version, found, err)
 	}
 	refresh(t, ctx, c)
 

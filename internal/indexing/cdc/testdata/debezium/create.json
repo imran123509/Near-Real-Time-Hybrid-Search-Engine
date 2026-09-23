@@ -1,0 +1,32 @@
+{
+  "before": null,
+  "after": {
+    "id": "5f2a9c1e-7b3d-4a6f-8e21-9c0d1b2a3f44",
+    "title": "Exactly-Once Semantics in Kafka",
+    "body": "Idempotent producers and transactions let Kafka applications avoid duplicate writes.",
+    "version": 11,
+    "updated_at": "2026-09-22T09:30:15.5Z",
+    "url": null
+  },
+  "source": {
+    "version": "3.6.3.Final",
+    "connector": "postgresql",
+    "name": "search",
+    "ts_ms": 1790069415500,
+    "snapshot": "false",
+    "db": "searchdb",
+    "sequence": "[\"24100000\",\"24100456\"]",
+    "ts_us": 1790069415500000,
+    "ts_ns": 1790069415500000000,
+    "schema": "public",
+    "table": "documents",
+    "txId": 761,
+    "lsn": 24100456,
+    "xmin": null
+  },
+  "transaction": null,
+  "op": "c",
+  "ts_ms": 1790069415700,
+  "ts_us": 1790069415700321,
+  "ts_ns": 1790069415700321000
+}

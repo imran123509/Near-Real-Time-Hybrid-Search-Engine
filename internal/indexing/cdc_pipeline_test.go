@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"near-real-time-hybrid-search-engine/internal/dlq"
 	"near-real-time-hybrid-search-engine/internal/indexing/cdc"
 	"near-real-time-hybrid-search-engine/internal/kafka"
+	"near-real-time-hybrid-search-engine/internal/retry"
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
 	"near-real-time-hybrid-search-engine/internal/search/qdrant"
 )
@@ -24,27 +27,53 @@ import (
 
 const cdcTestID = "7f1c9b2e-4a3d-4e8b-9c1a-2b3c4d5e6f70"
 
-// stores is a minimal in-memory pair of search indexes plus an embedder.
+// stores is a minimal in-memory pair of search indexes plus an embedder. Both
+// halves can be told to fail for a while, which is how the tests reproduce one
+// store being down while the other is not.
 type stores struct {
 	mu        sync.Mutex
 	documents map[string]opensearch.Document
 	points    map[string]qdrant.Point
 
 	// upsertFailures is how many more vector writes must fail with
-	// upsertErr; a negative value fails every one of them.
+	// upsertErr; a negative value fails every one of them. indexFailures and
+	// indexErr are the same for keyword writes, and embedFailures for the
+	// embedder.
 	upsertFailures int
 	upsertErr      error
+	indexFailures  int
+	indexErr       error
+	embedFailures  int
+	embedded       []string
+	embedErr       error
 }
 
 func newStores() *stores {
 	return &stores{documents: map[string]opensearch.Document{}, points: map[string]qdrant.Point{}}
 }
 
-func (s *stores) IndexDocument(_ context.Context, doc opensearch.Document) error {
+func (s *stores) IndexDocument(_ context.Context, doc opensearch.Document) (opensearch.WriteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.indexFailures != 0 {
+		if s.indexFailures > 0 {
+			s.indexFailures--
+		}
+		return opensearch.WriteUnknown, s.indexErr
+	}
+	// The same external versioning OpenSearch applies: a write that is not
+	// newer than what is stored is refused, and the answer says which case it
+	// was, so the caller can tell a redelivery from a superseded event.
+	if existing, ok := s.documents[doc.ID]; ok && existing.Version > 0 && doc.Version > 0 {
+		switch {
+		case doc.Version < existing.Version:
+			return opensearch.WriteStale, nil
+		case doc.Version == existing.Version:
+			return opensearch.WriteDuplicate, nil
+		}
+	}
 	s.documents[doc.ID] = doc
-	return nil
+	return opensearch.WriteApplied, nil
 }
 
 func (s *stores) DeleteDocument(_ context.Context, id string) error {
@@ -74,8 +103,33 @@ func (s *stores) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *stores) Embed(context.Context, string) ([]float32, error) {
+func (s *stores) Embed(_ context.Context, text string) ([]float32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.embedded = append(s.embedded, text)
+	if s.embedFailures != 0 {
+		if s.embedFailures > 0 {
+			s.embedFailures--
+		}
+		return nil, s.embedErr
+	}
 	return []float32{0.5, 0.5}, nil
+}
+
+// embedTexts returns the text of every embedding request so far, which is how
+// a test checks that a superseded row was never embedded.
+func (s *stores) embedTexts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.embedded...)
+}
+
+// point returns the stored point for a document, if any.
+func (s *stores) point(id string) (qdrant.Point, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.points[id]
+	return p, ok
 }
 
 func (s *stores) document(id string) opensearch.Document {
@@ -91,30 +145,51 @@ func (s *stores) counts() (documents, points int) {
 }
 
 // failUpserts makes the next n vector writes fail with err. A negative n
-// fails every write from now on.
+// fails every write from now on, and n = 0 stops the failures.
 func (s *stores) failUpserts(n int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.upsertFailures, s.upsertErr = n, err
 }
 
-// newCDCTestPipeline returns a pipeline over st with backoff removed, so the
-// tests do not spend real time sleeping between retries.
-func newCDCTestPipeline(t *testing.T, st *stores, dlq DeadLetterPublisher, maxAttempts int) *Pipeline[cdc.ChangeEvent] {
+// failIndexes does the same for keyword writes.
+func (s *stores) failIndexes(n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.indexFailures, s.indexErr = n, err
+}
+
+// failEmbeddings does the same for the embedder.
+func (s *stores) failEmbeddings(n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.embedFailures, s.embedErr = n, err
+}
+
+// attemptsPolicy retries n times with waits short enough that the tests do not
+// spend real time on them.
+func attemptsPolicy(n int) retry.Policy {
+	return retry.Policy{MaxAttempts: n, InitialBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond, Multiplier: 2}
+}
+
+// newCDCTestPipeline returns a pipeline over st that retries n times.
+func newCDCTestPipeline(t *testing.T, st *stores, deadLetters dlq.Publisher, policy retry.Policy) *Pipeline[cdc.ChangeEvent] {
 	t.Helper()
-	return newCDCTestPipelineWith(t, st, cdc.EmbedderFunc(st.Embed), dlq, maxAttempts)
+	return newCDCTestPipelineWith(t, st, cdc.EmbedderFunc(st.Embed), deadLetters, policy)
 }
 
 // newCDCTestPipelineWith is newCDCTestPipeline with the embedder chosen by the
 // test.
-func newCDCTestPipelineWith(t *testing.T, st *stores, embedder cdc.Embedder, dlq DeadLetterPublisher, maxAttempts int) *Pipeline[cdc.ChangeEvent] {
+func newCDCTestPipelineWith(t *testing.T, st *stores, embedder cdc.Embedder, deadLetters dlq.Publisher, policy retry.Policy) *Pipeline[cdc.ChangeEvent] {
 	t.Helper()
 	service, err := cdc.NewService(st, st, embedder, cdc.DefaultMapping())
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	p := NewCDCPipeline(service, dlq, maxAttempts, slog.New(slog.DiscardHandler))
-	p.backoff = func(int) time.Duration { return 0 }
+	p, err := NewCDCPipeline(service, deadLetters, policy, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewCDCPipeline: %v", err)
+	}
 	return p
 }
 
@@ -151,8 +226,8 @@ func tombstoneMessage(id string, offset int64) kafka.Message {
 
 func TestCDCPipelineIndexesChanges(t *testing.T) {
 	st := newStores()
-	dlq := &fakeDeadLetters{}
-	pipeline := newCDCTestPipeline(t, st, dlq, 3)
+	deadLetters := &fakeDeadLetters{}
+	pipeline := newCDCTestPipeline(t, st, deadLetters, attemptsPolicy(3))
 	ctx := context.Background()
 
 	if err := pipeline.Process(ctx, changeMessage("c", cdcTestID, 1, 0)); err != nil {
@@ -181,8 +256,8 @@ func TestCDCPipelineIndexesChanges(t *testing.T) {
 		t.Fatalf("after delete: %d documents, %d points; want both stores empty", documents, points)
 	}
 
-	if len(dlq.causes) != 0 {
-		t.Errorf("dead-lettered %d valid messages: %v", len(dlq.causes), dlq.causes)
+	if deadLetters.count() != 0 {
+		t.Errorf("dead-lettered %d valid messages: %v", deadLetters.count(), deadLetters.all())
 	}
 }
 
@@ -190,14 +265,14 @@ func TestCDCPipelineIndexesChanges(t *testing.T) {
 // not dead-lettered, or the dead-letter topic would fill with routine messages.
 func TestCDCPipelineSkipsTombstones(t *testing.T) {
 	st := newStores()
-	dlq := &fakeDeadLetters{}
-	pipeline := newCDCTestPipeline(t, st, dlq, 3)
+	deadLetters := &fakeDeadLetters{}
+	pipeline := newCDCTestPipeline(t, st, deadLetters, attemptsPolicy(3))
 
 	if err := pipeline.Process(context.Background(), tombstoneMessage(cdcTestID, 0)); err != nil {
 		t.Fatalf("Process returned %v, want nil so the offset is committed", err)
 	}
-	if len(dlq.causes) != 0 {
-		t.Errorf("a tombstone was dead-lettered: %v", dlq.causes)
+	if deadLetters.count() != 0 {
+		t.Errorf("a tombstone was dead-lettered: %v", deadLetters.all())
 	}
 	if documents, points := st.counts(); documents != 0 || points != 0 {
 		t.Errorf("a tombstone wrote to the stores: %d documents, %d points", documents, points)
@@ -224,13 +299,13 @@ func TestCDCPipelineDeadLettersUnfixableMessages(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			st := newStores()
-			dlq := &fakeDeadLetters{}
+			deadLetters := &fakeDeadLetters{}
 
-			if err := newCDCTestPipeline(t, st, dlq, 3).Process(context.Background(), tt.msg); err != nil {
+			if err := newCDCTestPipeline(t, st, deadLetters, attemptsPolicy(3)).Process(context.Background(), tt.msg); err != nil {
 				t.Fatalf("Process returned %v, want nil (message finished)", err)
 			}
-			if len(dlq.causes) != 1 {
-				t.Fatalf("dead-lettered %d messages, want 1", len(dlq.causes))
+			if deadLetters.count() != 1 {
+				t.Fatalf("dead-lettered %d messages, want 1", deadLetters.count())
 			}
 			if documents, points := st.counts(); documents != 0 || points != 0 {
 				t.Errorf("an unusable message reached the stores: %d documents, %d points", documents, points)
@@ -243,19 +318,19 @@ func TestCDCPipelineDeadLettersUnfixableMessages(t *testing.T) {
 // succeed once it comes back.
 func TestCDCPipelineRetriesTemporaryStoreFailures(t *testing.T) {
 	st := newStores()
-	dlq := &fakeDeadLetters{}
+	deadLetters := &fakeDeadLetters{}
 	// The vector store is unavailable for two attempts, then recovers.
 	st.failUpserts(2, errors.New("qdrant unavailable"))
 
-	pipeline := newCDCTestPipeline(t, st, dlq, 5)
+	pipeline := newCDCTestPipeline(t, st, deadLetters, attemptsPolicy(5))
 	if err := pipeline.Process(context.Background(), changeMessage("c", cdcTestID, 1, 0)); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
 	if documents, points := st.counts(); documents != 1 || points != 1 {
 		t.Fatalf("after the retry: %d documents, %d points; want 1 and 1", documents, points)
 	}
-	if len(dlq.causes) != 0 {
-		t.Errorf("a recoverable failure was dead-lettered: %v", dlq.causes)
+	if deadLetters.count() != 0 {
+		t.Errorf("a recoverable failure was dead-lettered: %v", deadLetters.all())
 	}
 }
 
@@ -264,15 +339,19 @@ func TestCDCPipelineRetriesTemporaryStoreFailures(t *testing.T) {
 // carries on.
 func TestCDCPipelineDeadLettersAfterRetriesAreExhausted(t *testing.T) {
 	st := newStores()
-	dlq := &fakeDeadLetters{}
+	deadLetters := &fakeDeadLetters{}
 	want := errors.New("qdrant unavailable")
 	st.failUpserts(-1, want)
 
-	if err := newCDCTestPipeline(t, st, dlq, 3).Process(context.Background(), changeMessage("c", cdcTestID, 1, 0)); err != nil {
+	if err := newCDCTestPipeline(t, st, deadLetters, attemptsPolicy(3)).Process(context.Background(), changeMessage("c", cdcTestID, 1, 0)); err != nil {
 		t.Fatalf("Process returned %v, want nil (message finished)", err)
 	}
-	if len(dlq.causes) != 1 || !errors.Is(dlq.causes[0], want) {
-		t.Fatalf("dead-letter causes = %v, want one wrapping %v", dlq.causes, want)
+	letter := deadLetters.only(t)
+	if !strings.Contains(letter.Error, want.Error()) {
+		t.Fatalf("dead-letter error = %q, want it to report %v", letter.Error, want)
+	}
+	if letter.Attempts != 3 {
+		t.Errorf("dead-lettered after %d attempts, want the configured 3", letter.Attempts)
 	}
 }
 
@@ -281,8 +360,8 @@ func TestCDCPipelineDeadLettersAfterRetriesAreExhausted(t *testing.T) {
 func TestCDCWorkerPoolProcessesEveryMessage(t *testing.T) {
 	const workers, documents = 4, 40
 	st := newStores()
-	dlq := &fakeDeadLetters{}
-	pipeline := newCDCTestPipeline(t, st, dlq, 3)
+	deadLetters := &fakeDeadLetters{}
+	pipeline := newCDCTestPipeline(t, st, deadLetters, attemptsPolicy(3))
 
 	var active, peak atomic.Int32
 	var done sync.WaitGroup
@@ -329,8 +408,8 @@ func TestCDCWorkerPoolProcessesEveryMessage(t *testing.T) {
 	if got := peak.Load(); got > workers {
 		t.Errorf("peak concurrency = %d, want at most the configured %d workers", got, workers)
 	}
-	if len(dlq.causes) != 0 {
-		t.Errorf("dead-lettered %d valid messages: %v", len(dlq.causes), dlq.causes)
+	if deadLetters.count() != 0 {
+		t.Errorf("dead-lettered %d valid messages: %v", deadLetters.count(), deadLetters.all())
 	}
 }
 
@@ -383,7 +462,7 @@ func TestCDCWorkerPoolShutdownLeavesNoGoroutines(t *testing.T) {
 
 	for range 5 {
 		st := newStores()
-		pipeline := newCDCTestPipeline(t, st, &fakeDeadLetters{}, 3)
+		pipeline := newCDCTestPipeline(t, st, &fakeDeadLetters{}, attemptsPolicy(3))
 
 		pool, err := NewWorkerPool(8, 16, pipeline.Process, func(err error) { t.Errorf("unexpected fatal error: %v", err) },
 			slog.New(slog.DiscardHandler))
@@ -418,7 +497,7 @@ func TestCDCWorkerPoolShutdownLeavesNoGoroutines(t *testing.T) {
 // being committed, so the messages are delivered again after a restart.
 func TestCDCWorkerPoolStopsOnContextCancellation(t *testing.T) {
 	st := newStores()
-	pipeline := newCDCTestPipeline(t, st, &fakeDeadLetters{}, 100)
+	pipeline := newCDCTestPipeline(t, st, &fakeDeadLetters{}, retry.Policy{MaxAttempts: 100, InitialBackoff: 50 * time.Millisecond, MaxBackoff: time.Second, Multiplier: 2})
 	// Keep the indexing path failing so the message is still being retried
 	// when the context is cancelled.
 	st.failUpserts(-1, errors.New("qdrant unavailable"))

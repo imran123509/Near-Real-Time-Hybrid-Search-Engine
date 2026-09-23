@@ -79,6 +79,9 @@ func New(ctx context.Context, cfg config.EmbeddingConfig) (Provider, error) {
 	switch cfg.Provider {
 	case ProviderGemini:
 		return NewGeminiProvider(ctx, cfg)
+	case ProviderFake:
+		// Local, deterministic vectors for tests; see fake.go.
+		return NewFakeProvider(cfg)
 	default:
 		return nil, fmt.Errorf("%w: %q", ErrUnknownProvider, cfg.Provider)
 	}

@@ -35,8 +35,11 @@ func (f EmbedderFunc) Embed(ctx context.Context, text string) ([]float32, error)
 
 // KeywordIndex is the part of the OpenSearch client the service uses.
 // *opensearch.Client satisfies it.
+//
+// IndexDocument reports what its write did, which is what lets the service
+// tell a redelivered event from one the index has already moved past.
 type KeywordIndex interface {
-	IndexDocument(ctx context.Context, doc opensearch.Document) error
+	IndexDocument(ctx context.Context, doc opensearch.Document) (opensearch.WriteResult, error)
 	DeleteDocument(ctx context.Context, id string) error
 }
 
@@ -68,6 +71,23 @@ type VectorIndex interface {
 // This does not rely on Kafka delivering each message once, which it does not
 // guarantee: after a crash or a rebalance, messages past the last committed
 // offset are delivered again, and re-applying them is harmless.
+//
+// No record of processed events is kept anywhere, and none is needed: every
+// write already says what the final state should be, so applying it twice and
+// applying it once leave the same state. An event store would add a database
+// to keep consistent with the two indexes, and would still not make the pair
+// of writes atomic.
+//
+// # Stale events
+//
+// Events for one row share a Kafka key and therefore a partition, so the
+// consumer applies them in the order the database made them. Where that order
+// can still break -- a rebalance leaving two consumers briefly overlapping, a
+// dead-lettered event, a manual replay -- the version column decides instead:
+// OpenSearch refuses a write that is not newer than what it holds, and this
+// service stops there rather than sending the older row on to the embedder and
+// Qdrant, which have no version check of their own. What it reports then is
+// EffectStale.
 //
 // # Partial failure
 //
@@ -131,19 +151,20 @@ func NewService(keyword KeywordIndex, vectors VectorIndex, embedder Embedder, ma
 	return &Service{keyword: keyword, vectors: vectors, embedder: embedder, mapping: mapping}, nil
 }
 
-// Process applies one change event to both search indexes.
+// Process applies one change event to both search indexes and reports what it
+// did, which is EffectNone whenever it returns an error.
 //
 // Creates, updates and snapshot reads all write the current row; only the
 // operation recorded in logs and metrics tells them apart. Deletes remove the
 // document from both stores.
-func (s *Service) Process(ctx context.Context, ev ChangeEvent) error {
+func (s *Service) Process(ctx context.Context, ev ChangeEvent) (Effect, error) {
 	if err := ev.Validate(); err != nil {
-		return err
+		return EffectNone, err
 	}
 	// Starting writes that cannot finish would only widen the gap between
 	// the two stores.
 	if err := ctx.Err(); err != nil {
-		return err
+		return EffectNone, err
 	}
 	if ev.Operation == OperationDelete {
 		return s.delete(ctx, ev.ID)
@@ -152,21 +173,31 @@ func (s *Service) Process(ctx context.Context, ev ChangeEvent) error {
 }
 
 // upsert writes the current state of a row to both indexes.
-func (s *Service) upsert(ctx context.Context, ev ChangeEvent) error {
+func (s *Service) upsert(ctx context.Context, ev ChangeEvent) (Effect, error) {
 	doc, err := s.mapping.Document(ev)
 	if err != nil {
-		return err
+		return EffectNone, err
 	}
 
 	// Checked before any write: a document with no text is not worth
 	// keyword-indexing either.
 	text := BuildEmbeddingText(doc)
 	if text == "" {
-		return fmt.Errorf("%w: %s", ErrNoEmbeddingText, ev.ID)
+		return EffectNone, fmt.Errorf("%w: %s", ErrNoEmbeddingText, ev.ID)
 	}
 
-	if err := s.keyword.IndexDocument(ctx, doc); err != nil {
-		return storeErr(StoreKeyword, ev.ID, err)
+	written, err := s.keyword.IndexDocument(ctx, doc)
+	if err != nil {
+		return EffectNone, storeErr(StoreKeyword, ev.ID, err)
+	}
+	if written == opensearch.WriteStale {
+		// A later event for this row has already been applied. Qdrant has no
+		// version check of its own, so embedding this row now and upserting
+		// it would replace a newer vector with an older one -- the one thing
+		// the keyword index refuses to do. Stopping here is what extends that
+		// protection to the vector index, and it costs nothing: there is
+		// nothing left in this event that is not already superseded.
+		return EffectStale, nil
 	}
 
 	// From here on OpenSearch already holds the new document, so any failure
@@ -174,7 +205,7 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) error {
 	// which is safe because every write is idempotent.
 	vector, err := s.embedder.Embed(ctx, text)
 	if err != nil {
-		return storeErr(StoreEmbedder, ev.ID, err)
+		return EffectNone, storeErr(StoreEmbedder, ev.ID, err)
 	}
 
 	err = s.vectors.Upsert(ctx, qdrant.Point{
@@ -183,16 +214,25 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) error {
 		Payload: s.mapping.VectorPayload(doc),
 	})
 	if err != nil {
-		return storeErr(StoreVector, ev.ID, err)
+		return EffectNone, storeErr(StoreVector, ev.ID, err)
 	}
-	return nil
+	if written == opensearch.WriteDuplicate {
+		return EffectReapplied, nil
+	}
+	return EffectIndexed, nil
 }
 
 // delete removes a document from both indexes, asking both even when the
 // first fails so that a document is never left behind in one of them.
-func (s *Service) delete(ctx context.Context, id string) error {
-	return errors.Join(
+func (s *Service) delete(ctx context.Context, id string) (Effect, error) {
+	err := errors.Join(
 		storeErr(StoreKeyword, id, s.keyword.DeleteDocument(ctx, id)),
 		storeErr(StoreVector, id, s.vectors.Delete(ctx, id)),
 	)
+	if err != nil {
+		return EffectNone, err
+	}
+	// Both stores treat deleting something that is not there as success, so a
+	// repeated delete ends here too, with the same final state.
+	return EffectDeleted, nil
 }

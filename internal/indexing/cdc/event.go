@@ -20,6 +20,7 @@ package cdc
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -107,6 +108,69 @@ type ChangeEvent struct {
 	// Timestamp is when the change was committed in the source database, or
 	// the zero time when the connector did not report one.
 	Timestamp time.Time
+
+	// Database is the source database name, kept for diagnostics. It is not
+	// part of the event identity: one connector serves one database here.
+	Database string
+
+	// LSN is the write-ahead log position of the change, and TxID the
+	// transaction that made it. Both are reported by the PostgreSQL
+	// connector on every event, snapshot reads included, and are 0 when a
+	// connector leaves them out. LSN increases with the log, so it both
+	// identifies an event and orders it against other events for the same
+	// row.
+	LSN  int64
+	TxID int64
+	// Snapshot is true when the connector read the row during its initial
+	// snapshot rather than from the log.
+	Snapshot bool
+}
+
+// EventID is this event's identity: the same database change always produces
+// the same string, and two different changes never produce the same one.
+//
+// It is built only from what the connector reported -- source table, primary
+// key, operation and log position -- and never from a clock or a random
+// source. A redelivered message therefore carries the identity it had the
+// first time, which is what makes a replay recognisable in a log line. A
+// uuid.New() here would make every delivery look new and duplicate detection
+// impossible.
+//
+//	public.documents:7f1c9b2e-4a3d-4e8b-9c1a-2b3c4d5e6f70:UPDATE@lsn:24100912
+//
+// The log position is what separates two otherwise identical changes, such as
+// a column being set to the same value twice. Without one, the commit
+// timestamp stands in and the identity is only as unique as that timestamp;
+// PostgreSQL events always carry an LSN.
+//
+// It identifies an event, not a document: a document's whole history, from
+// its CREATE to its DELETE, shares one ID (see ChangeEvent.ID) and produces a
+// different EventID for every change along the way.
+func (e ChangeEvent) EventID() string {
+	return e.qualifiedTable() + ":" + e.ID + ":" + string(e.Operation) + "@" + e.position()
+}
+
+// position renders the point in the source log this event came from.
+func (e ChangeEvent) position() string {
+	switch {
+	case e.LSN > 0:
+		return "lsn:" + strconv.FormatInt(e.LSN, 10)
+	case !e.Timestamp.IsZero():
+		return "ts:" + strconv.FormatInt(e.Timestamp.UnixMilli(), 10)
+	default:
+		return "unknown"
+	}
+}
+
+func (e ChangeEvent) qualifiedTable() string {
+	switch {
+	case e.Schema != "" && e.Table != "":
+		return e.Schema + "." + e.Table
+	case e.Table != "":
+		return e.Table
+	default:
+		return "unknown"
+	}
 }
 
 // Validate reports whether the event can be processed.
@@ -123,14 +187,47 @@ func (e ChangeEvent) Validate() error {
 // LogAttrs returns the key/value pairs describing this event for structured
 // logging. It deliberately leaves out Row: document contents do not belong in
 // logs, and a row may hold personal data.
+//
+// event_id and document_id are both here and are not the same thing: one line
+// per event, many events per document, which is what makes a redelivery
+// visible as the same event_id appearing twice.
 func (e ChangeEvent) LogAttrs() []any {
-	return []any{
+	attrs := []any{
+		"event_id", e.EventID(),
 		"document_id", e.ID,
 		"operation", string(e.Operation),
 		"schema", e.Schema,
 		"table", e.Table,
 	}
+	if e.LSN > 0 {
+		attrs = append(attrs, "lsn", e.LSN)
+	}
+	return attrs
 }
+
+// Effect is what applying an event did to the search indexes. It is how a
+// caller tells an ordinary change from a redelivery and from an event the
+// indexes have already moved past, which is what the duplicate and stale
+// counters a metrics exporter will add are built on.
+type Effect string
+
+const (
+	// EffectNone means nothing was applied. It accompanies every error.
+	EffectNone Effect = ""
+	// EffectIndexed means both stores now hold this event's data.
+	EffectIndexed Effect = "indexed"
+	// EffectReapplied means the keyword index already held exactly this
+	// version, so this delivery was a repeat. The writes were made again
+	// anyway, because an earlier attempt may have stopped part way through,
+	// and repeating them changes nothing.
+	EffectReapplied Effect = "reapplied"
+	// EffectStale means the indexes hold data from a later event, so nothing
+	// was written. The event is finished: there is nothing left to apply.
+	EffectStale Effect = "stale"
+	// EffectDeleted means the document was removed from both stores, or was
+	// already absent from them.
+	EffectDeleted Effect = "deleted"
+)
 
 // Store names a downstream system, so that a failure can be attributed to one
 // of them. Counting failures per store is the hook a metrics exporter will
