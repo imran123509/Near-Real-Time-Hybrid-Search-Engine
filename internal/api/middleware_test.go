@@ -62,7 +62,7 @@ func TestAccessLog(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(NewLogHandler(slog.NewTextHandler(&buf, nil)))
 	s := &fakeSearcher{results: []hybrid.Result{{ID: "a"}}}
-	h := NewRouter(NewSearchHandler(s, time.Second), NewReadinessHandler(logger), logger)
+	h := NewRouter(NewSearchHandler(s, time.Second), NewReadinessHandler(logger), logger, Options{})
 
 	rec := serve(h, http.MethodGet, "/api/v1/search?q=patient+record+4411", http.Header{RequestIDHeader: {"req-1"}})
 	if rec.Code != http.StatusOK {
@@ -84,7 +84,7 @@ func TestPanicRecovery(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(NewLogHandler(slog.NewTextHandler(&buf, nil)))
 	s := &fakeSearcher{block: func(context.Context) error { panic("nil map write") }}
-	h := NewRouter(NewSearchHandler(s, time.Second), NewReadinessHandler(logger), logger)
+	h := NewRouter(NewSearchHandler(s, time.Second), NewReadinessHandler(logger), logger, Options{})
 
 	rec := serve(h, http.MethodGet, "/api/v1/search?q=golang", http.Header{RequestIDHeader: {"req-panic"}})
 

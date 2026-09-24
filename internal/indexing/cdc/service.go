@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
 	"near-real-time-hybrid-search-engine/internal/search/qdrant"
@@ -133,6 +134,51 @@ type Service struct {
 	vectors  VectorIndex
 	embedder Embedder
 	mapping  FieldMapping
+	observe  Observer
+}
+
+// StoreCall is one call to one downstream system: how long it took and
+// whether it worked. It carries no document ID and no payload.
+type StoreCall struct {
+	Store Store
+	// Operation is what was asked of it: index, delete, upsert or embed. The
+	// set is fixed, so it is safe as a metric label.
+	Operation string
+	Duration  time.Duration
+	Err       error
+}
+
+// EventApplied is one change event after the service has finished with it.
+type EventApplied struct {
+	Operation Operation
+	Effect    Effect
+	Duration  time.Duration
+	// Store names the system that failed, when one did.
+	Store Store
+	Err   error
+}
+
+// Observer is told what the service did. It exists so that metrics can be
+// attached without this package knowing anything about a metrics library, the
+// same way the pipeline above it reports its outcomes.
+//
+// Both methods run on the worker that processed the event, so neither may
+// block.
+type Observer interface {
+	StoreCalled(call StoreCall)
+	EventApplied(event EventApplied)
+}
+
+// Observe registers o, replacing any previous observer. A nil observer turns
+// observation off.
+func (s *Service) Observe(o Observer) { s.observe = o }
+
+// storeCalled reports one downstream call, if anyone is listening.
+func (s *Service) storeCalled(store Store, operation string, started time.Time, err error) {
+	if s.observe == nil {
+		return
+	}
+	s.observe.StoreCalled(StoreCall{Store: store, Operation: operation, Duration: time.Since(started), Err: err})
 }
 
 // NewService returns a Service that writes documents described by mapping.
@@ -158,6 +204,23 @@ func NewService(keyword KeywordIndex, vectors VectorIndex, embedder Embedder, ma
 // operation recorded in logs and metrics tells them apart. Deletes remove the
 // document from both stores.
 func (s *Service) Process(ctx context.Context, ev ChangeEvent) (Effect, error) {
+	started := time.Now()
+	effect, err := s.process(ctx, ev)
+
+	if s.observe != nil {
+		applied := EventApplied{Operation: ev.Operation, Effect: effect, Duration: time.Since(started), Err: err}
+		// Which store failed is the difference between a rejected event and a
+		// half-applied one, so it is reported rather than only logged.
+		var storeErr *StoreError
+		if errors.As(err, &storeErr) {
+			applied.Store = storeErr.Store
+		}
+		s.observe.EventApplied(applied)
+	}
+	return effect, err
+}
+
+func (s *Service) process(ctx context.Context, ev ChangeEvent) (Effect, error) {
 	if err := ev.Validate(); err != nil {
 		return EffectNone, err
 	}
@@ -186,7 +249,9 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) (Effect, error) {
 		return EffectNone, fmt.Errorf("%w: %s", ErrNoEmbeddingText, ev.ID)
 	}
 
+	started := time.Now()
 	written, err := s.keyword.IndexDocument(ctx, doc)
+	s.storeCalled(StoreKeyword, "index", started, err)
 	if err != nil {
 		return EffectNone, storeErr(StoreKeyword, ev.ID, err)
 	}
@@ -203,16 +268,20 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) (Effect, error) {
 	// From here on OpenSearch already holds the new document, so any failure
 	// leaves the vector index behind until this event is processed again,
 	// which is safe because every write is idempotent.
+	started = time.Now()
 	vector, err := s.embedder.Embed(ctx, text)
+	s.storeCalled(StoreEmbedder, "embed", started, err)
 	if err != nil {
 		return EffectNone, storeErr(StoreEmbedder, ev.ID, err)
 	}
 
+	started = time.Now()
 	err = s.vectors.Upsert(ctx, qdrant.Point{
 		ID:      doc.ID,
 		Vector:  vector,
 		Payload: s.mapping.VectorPayload(doc),
 	})
+	s.storeCalled(StoreVector, "upsert", started, err)
 	if err != nil {
 		return EffectNone, storeErr(StoreVector, ev.ID, err)
 	}
@@ -225,9 +294,17 @@ func (s *Service) upsert(ctx context.Context, ev ChangeEvent) (Effect, error) {
 // delete removes a document from both indexes, asking both even when the
 // first fails so that a document is never left behind in one of them.
 func (s *Service) delete(ctx context.Context, id string) (Effect, error) {
+	keywordStart := time.Now()
+	keywordErr := s.keyword.DeleteDocument(ctx, id)
+	s.storeCalled(StoreKeyword, "delete", keywordStart, keywordErr)
+
+	vectorStart := time.Now()
+	vectorErr := s.vectors.Delete(ctx, id)
+	s.storeCalled(StoreVector, "delete", vectorStart, vectorErr)
+
 	err := errors.Join(
-		storeErr(StoreKeyword, id, s.keyword.DeleteDocument(ctx, id)),
-		storeErr(StoreVector, id, s.vectors.Delete(ctx, id)),
+		storeErr(StoreKeyword, id, keywordErr),
+		storeErr(StoreVector, id, vectorErr),
 	)
 	if err != nil {
 		return EffectNone, err

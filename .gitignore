@@ -10,3 +10,10 @@
 # Test and coverage output
 *.test
 *.out
+
+# Benchmark output. The scripts and the results template are committed; the
+# runs they produce are not, because they are large, machine-specific and
+# regenerated every time.
+/benchmarks/results/*
+!/benchmarks/results/.gitkeep
+!/benchmarks/results/README.md

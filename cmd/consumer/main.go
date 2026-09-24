@@ -11,16 +11,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"near-real-time-hybrid-search-engine/internal/config"
 	"near-real-time-hybrid-search-engine/internal/embedding"
 	"near-real-time-hybrid-search-engine/internal/indexing"
 	"near-real-time-hybrid-search-engine/internal/indexing/cdc"
 	"near-real-time-hybrid-search-engine/internal/kafka"
+	"near-real-time-hybrid-search-engine/internal/metrics"
 	"near-real-time-hybrid-search-engine/internal/retry"
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
 	"near-real-time-hybrid-search-engine/internal/search/qdrant"
@@ -62,6 +66,13 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 		"retry_max_backoff", cfg.Kafka.Retry.MaxBackoff,
 		"retry_multiplier", cfg.Kafka.Retry.Multiplier,
 		"startup_timeout", cfg.App.StartupTimeout)
+
+	// Built once, before anything that reports into it.
+	var m *metrics.Metrics
+	if cfg.Metrics.Enabled {
+		m = metrics.New(prometheus.DefaultRegisterer)
+		m.SetInfo(cfg.App.Name, cfg.App.Env, "consumer")
+	}
 
 	// Dependencies may still be starting; each is retried until this deadline.
 	initCtx, cancelInit := context.WithTimeout(ctx, cfg.App.StartupTimeout)
@@ -135,6 +146,14 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 	if err != nil {
 		return fmt.Errorf("init indexing pipeline: %w", err)
 	}
+	// Observation only: every hook below reports what already happened and
+	// changes nothing about how a message is processed or committed.
+	if cfg.Metrics.Enabled {
+		consumer.Observe(m.ConsumerObserver())
+		changes.Observe(m.CDCObserver())
+		pipeline.Observe(m.PipelineObserver(cfg.Kafka.Topic))
+		pipeline.ObserveRetry(m.RetryObserver())
+	}
 
 	// consumeCtx stops fetching on a shutdown signal, or when a worker reports
 	// a failure that makes it unsafe to keep committing offsets.
@@ -146,6 +165,15 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 		return fmt.Errorf("init worker pool: %w", err)
 	}
 	workers.Start(rootCtx)
+
+	// The consumer has no HTTP server of its own, and its metrics -- Kafka,
+	// retries, dead letters, the worker pool -- are the ones worth watching,
+	// so it serves them on a listener that shares nothing with the work.
+	if cfg.Metrics.Enabled {
+		m.BindWorkerPool(workers.Stats)
+		stopMetrics := serveMetrics(cfg.Metrics, logger)
+		defer stopMetrics()
+	}
 
 	logger.Info("consuming messages")
 	runErr := consumer.Run(consumeCtx, workers.Submit)
@@ -173,6 +201,34 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 	// Deferred closes now run in reverse order: dead-letter writer, Kafka
 	// consumer (flushing the final offset commits), Qdrant, then OpenSearch.
 	return runErr
+}
+
+// metricsShutdownTimeout bounds how long a scrape in progress may hold up
+// shutdown. Metrics must never be the reason a consumer takes long to stop.
+const metricsShutdownTimeout = 3 * time.Second
+
+// serveMetrics starts the metrics listener and returns the function that
+// stops it. A failure to listen is logged and nothing else: losing metrics
+// must not stop the consumer from indexing.
+func serveMetrics(cfg config.MetricsConfig, logger *slog.Logger) func() {
+	srv := metrics.NewServer(cfg.Addr, cfg.Path, prometheus.DefaultGatherer, logger)
+
+	go func() {
+		logger.Info("metrics server starting", "addr", cfg.Addr, "path", cfg.Path)
+		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server stopped", "error", err)
+		}
+	}()
+
+	return func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("shutting down the metrics server failed", "error", err)
+			return
+		}
+		logger.Info("metrics server stopped")
+	}
 }
 
 // retryPolicy turns the configured retry settings into the policy the

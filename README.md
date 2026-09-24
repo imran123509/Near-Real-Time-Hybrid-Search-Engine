@@ -17,6 +17,7 @@ HTTP client ──> api ──┬──> OpenSearch ─────────�
 
 - `cmd/api` – HTTP search API
 - `cmd/consumer` – Kafka consumer that applies Debezium change events to both indexes
+- `cmd/loadgen` – indexing benchmarks: generates changes and measures the pipeline
 - `internal/api` – HTTP handlers, routes and middleware
 - `internal/search/hybrid` – runs keyword and vector search and fuses them with RRF
 - `internal/search/opensearch`, `internal/search/qdrant` – the two search indexes
@@ -29,11 +30,14 @@ HTTP client ──> api ──┬──> OpenSearch ─────────�
 - `internal/kafka` – Kafka consumer and dead-letter writer
 - `internal/postgres` – PostgreSQL connection pool and repository
 - `internal/startup` – bounded retries while dependencies start
+- `internal/metrics` – Prometheus metrics and the /metrics endpoint
 - `internal/config` – configuration loading
 - `tests/e2e` – end-to-end tests against the running stack
 - `migrations/` – database migrations
-- `docker/` – PostgreSQL initialisation and the Debezium connector configuration
-- `scripts/` – Debezium connector registration and the end-to-end runner
+- `docker/` – PostgreSQL initialisation, the Debezium connector and the Prometheus scrape configuration
+- `docs/` – [metrics reference](docs/metrics.md)
+- `scripts/` – Debezium connector registration, the end-to-end runner and the benchmarks
+- `benchmarks/` – k6 search load tests and the results template
 
 ## Running locally with Docker Compose
 
@@ -85,12 +89,14 @@ they tolerate starting before them outside Compose too, without retrying forever
 
 | Service | Address | Notes |
 |---|---|---|
-| Search API | http://localhost:8080 | `/api/v1/search`, `/health`, `/ready` |
+| Search API | http://localhost:8080 | `/api/v1/search`, `/health`, `/ready`, `/metrics` |
 | PostgreSQL | localhost:5432 | database `searchdb` |
 | Kafka | localhost:29092 | containers use `kafka:9092` |
 | Kafka Connect REST | http://localhost:8083 | connector `documents-cdc` |
 | OpenSearch | http://localhost:9200 | security disabled: local development only |
 | Qdrant | http://localhost:6333 (REST, dashboard at `/dashboard`), localhost:6334 (gRPC) | |
+| Consumer metrics | http://localhost:9091/metrics | the consumer has no other HTTP endpoint |
+| Prometheus | http://localhost:9090 | scrapes the api and the consumer every 15s |
 
 ### Everyday commands
 
@@ -493,3 +499,58 @@ scripts/e2e.sh         # macOS, Linux, Git Bash
 
 They need no embedding API key, and `go test ./...` skips them unless `E2E` is
 set. See [tests/e2e/README.md](tests/e2e/README.md).
+
+## Metrics
+
+Both services expose Prometheus metrics, and Prometheus scrapes them every 15
+seconds:
+
+```text
+api       :8080/metrics   HTTP traffic, search latency, the calls each search makes
+consumer  :9091/metrics   Kafka, retries, dead letters, indexing, the worker pool
+                ↓
+           Prometheus :9090
+```
+
+```powershell
+curl.exe -s http://localhost:8080/metrics | Select-String hybrid_search_search_requests_total
+curl.exe -s "http://localhost:9090/api/v1/targets?state=active" | Select-String '"health":"up"'
+```
+
+Every metric is prefixed `hybrid_search_`, and every label is a bounded set —
+method, route, status, operation, dependency, outcome, error_type — so a query
+string, a document ID or an error message can never turn one metric into a
+million time series. The Go runtime and process collectors come along for free
+on the same endpoints.
+
+Instrumentation is observational: the packages being measured know nothing
+about Prometheus, they report through small hooks, and stopping Prometheus
+loses the graphs rather than the search engine. `METRICS_ENABLED=false` turns
+the endpoints off entirely. See [docs/metrics.md](docs/metrics.md) for every
+metric, its labels and what it means.
+
+### Benchmarks
+
+Two different measurements, kept apart:
+
+```sh
+# what one function costs: rank fusion, event parsing, document mapping
+go test -run '^$' -bench . -benchmem ./internal/search/rrf/ ./internal/indexing/cdc/
+```
+
+```powershell
+# what the system does under traffic, against the running stack
+./scripts/loadtest.ps1 -Suite search   -Scenario baseline   # k6 against the API
+./scripts/loadtest.ps1 -Suite indexing -Count 1000          # PostgreSQL to both indexes
+./scripts/loadtest.ps1 -Suite workers  -Workers 1,2,4,8     # where more workers stop helping
+./scripts/loadtest.ps1 -Suite backpressure -Rate 1000       # produce faster than the consumer
+./scripts/loadtest.ps1 -Suite recovery                      # stop OpenSearch under load
+./scripts/cleanup-loadtest.ps1                              # delete what a run created
+```
+
+Benchmarks always run with `EMBEDDING_PROVIDER=fake`: the real provider's
+network latency, rate limits and cost would be in every number and no two runs
+would be comparable. Results go in
+[benchmarks/results/README.md](benchmarks/results/README.md), with the machine
+they were measured on — the template is deliberately empty until someone runs
+them. See [benchmarks/README.md](benchmarks/README.md).

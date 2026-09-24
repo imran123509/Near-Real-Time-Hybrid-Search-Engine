@@ -52,7 +52,7 @@ func (f *fakeSearcher) calls() int {
 }
 
 func newTestRouter(s Searcher, checks ...ReadinessCheck) http.Handler {
-	return NewRouter(NewSearchHandler(s, time.Second), NewReadinessHandler(discardLogger, checks...), discardLogger)
+	return NewRouter(NewSearchHandler(s, time.Second), NewReadinessHandler(discardLogger, checks...), discardLogger, Options{})
 }
 
 func serve(h http.Handler, method, target string, header http.Header) *httptest.ResponseRecorder {
@@ -295,7 +295,7 @@ func TestSearchTimeout(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}}
-	h := NewRouter(NewSearchHandler(s, 20*time.Millisecond), NewReadinessHandler(discardLogger), discardLogger)
+	h := NewRouter(NewSearchHandler(s, 20*time.Millisecond), NewReadinessHandler(discardLogger), discardLogger, Options{})
 
 	rec := serve(h, http.MethodGet, "/api/v1/search?q=golang", nil)
 	expectError(t, rec, http.StatusGatewayTimeout, CodeTimeout)
@@ -348,7 +348,7 @@ func TestReady(t *testing.T) {
 		}
 		ready := NewReadinessHandler(discardLogger, ReadinessCheck{"qdrant", hung})
 		ready.timeout = 20 * time.Millisecond
-		h := NewRouter(NewSearchHandler(&fakeSearcher{}, time.Second), ready, discardLogger)
+		h := NewRouter(NewSearchHandler(&fakeSearcher{}, time.Second), ready, discardLogger, Options{})
 
 		start := time.Now()
 		rec := serve(h, http.MethodGet, "/ready", nil)
@@ -388,5 +388,81 @@ func TestEveryResponseIsJSON(t *testing.T) {
 	rec := serve(h, http.MethodDelete, "/health", nil)
 	if allow := rec.Header().Get("Allow"); allow != "GET, HEAD" {
 		t.Errorf("Allow = %q, want \"GET, HEAD\"", allow)
+	}
+}
+
+// The metrics endpoint is optional and lives on the same server as everything
+// else, behind the same middleware, so that one port and one shutdown cover
+// the whole API.
+func TestMetricsEndpointIsOptional(t *testing.T) {
+	t.Run("absent unless a handler is given", func(t *testing.T) {
+		h := NewRouter(NewSearchHandler(&fakeSearcher{}, time.Second), NewReadinessHandler(discardLogger), discardLogger, Options{})
+		if rec := serve(h, http.MethodGet, "/metrics", nil); rec.Code != http.StatusNotFound {
+			t.Errorf("status = %d, want 404 when metrics are switched off", rec.Code)
+		}
+	})
+
+	t.Run("served at the configured path", func(t *testing.T) {
+		exposition := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("# HELP something_total help\n"))
+		})
+		h := NewRouter(NewSearchHandler(&fakeSearcher{}, time.Second), NewReadinessHandler(discardLogger), discardLogger,
+			Options{Metrics: exposition, MetricsPath: "/metrics"})
+
+		rec := serve(h, http.MethodGet, "/metrics", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if body := rec.Body.String(); !strings.Contains(body, "# HELP") {
+			t.Errorf("body = %q, want the exposition format untouched", body)
+		}
+		// Writing metrics is not something a client does.
+		if rec := serve(h, http.MethodPost, "/metrics", nil); rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("POST /metrics = %d, want 405", rec.Code)
+		}
+	})
+
+	t.Run("middleware wraps every route", func(t *testing.T) {
+		var seen []string
+		h := NewRouter(NewSearchHandler(&fakeSearcher{}, time.Second), NewReadinessHandler(discardLogger), discardLogger,
+			Options{
+				Metrics:     http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
+				MetricsPath: "/metrics",
+				Middleware: func(next http.Handler) http.Handler {
+					return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						seen = append(seen, r.URL.Path)
+						next.ServeHTTP(w, r)
+					})
+				},
+			})
+
+		for _, path := range []string{"/api/v1/search?q=go", "/health", "/ready", "/metrics", "/nothing"} {
+			serve(h, http.MethodGet, path, nil)
+		}
+		if len(seen) != 5 {
+			t.Errorf("middleware saw %v, want all five requests", seen)
+		}
+	})
+}
+
+// Readiness is reported to whoever is watching, whether the probe came from a
+// client or from the metrics sampler, so that the gauge and the endpoint can
+// never disagree.
+func TestReadinessIsObservable(t *testing.T) {
+	failing := func(context.Context) error { return errors.New("unavailable") }
+	ready := NewReadinessHandler(discardLogger, ReadinessCheck{"opensearch", failing})
+
+	var results []bool
+	ready.Observe(func(ok bool) { results = append(results, ok) })
+
+	h := NewRouter(NewSearchHandler(&fakeSearcher{}, time.Second), ready, discardLogger, Options{})
+	if rec := serve(h, http.MethodGet, "/ready", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if ready.Check(context.Background()) {
+		t.Error("Check reported ready while the endpoint answered 503")
+	}
+	if len(results) != 2 || results[0] || results[1] {
+		t.Errorf("observed %v, want two failing checks", results)
 	}
 }

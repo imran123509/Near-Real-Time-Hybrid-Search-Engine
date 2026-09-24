@@ -104,12 +104,13 @@ type Report struct {
 // write once and return the error, so the policy lives here rather than being
 // spread through the pipeline.
 type Pipeline[E LoggableEvent] struct {
-	decode      DecodeFunc[E]
-	indexer     EventIndexer[E]
-	deadLetters dlq.Publisher
-	retries     *retry.Runner
-	logger      *slog.Logger
-	observe     func(Report)
+	decode       DecodeFunc[E]
+	indexer      EventIndexer[E]
+	deadLetters  dlq.Publisher
+	retries      *retry.Runner
+	logger       *slog.Logger
+	observe      func(Report)
+	observeRetry func(retry.Attempt)
 }
 
 // NewPipeline returns a Pipeline that parses messages with decode and retries
@@ -136,8 +137,14 @@ func NewPipeline[E LoggableEvent](
 }
 
 // Observe registers a function called once per finished message. It is the
-// single place to add metrics later, and it must not block.
+// single place metrics are attached, and it must not block.
 func (p *Pipeline[E]) Observe(f func(Report)) { p.observe = f }
+
+// ObserveRetry registers a function called before each wait between attempts.
+// One message produces one Report and zero or more retries, so this is where
+// retry activity is counted; the Report alone cannot say how a failure that
+// was later recovered from was classified.
+func (p *Pipeline[E]) ObserveRetry(f func(retry.Attempt)) { p.observeRetry = f }
 
 // Process handles one message. A nil result means the message is finished,
 // either indexed or dead-lettered, and its offset may be committed. A non-nil
@@ -250,6 +257,9 @@ func (p *Pipeline[E]) logRetry(a retry.Attempt) {
 	p.logger.Warn("event_processing_failed",
 		"attempt", a.Number, "max_attempts", p.retries.Policy().MaxAttempts,
 		"error_type", a.Kind.String(), "backoff", a.Delay, "error", a.Err)
+	if p.observeRetry != nil {
+		p.observeRetry(a)
+	}
 }
 
 func (p *Pipeline[E]) report(r Report) {

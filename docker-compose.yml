@@ -267,6 +267,17 @@ services:
       KAFKA_RETRY_INITIAL_BACKOFF: ${KAFKA_RETRY_INITIAL_BACKOFF:-500ms}
       KAFKA_RETRY_MAX_BACKOFF: ${KAFKA_RETRY_MAX_BACKOFF:-30s}
       KAFKA_RETRY_MULTIPLIER: ${KAFKA_RETRY_MULTIPLIER:-2}
+      # How many messages are indexed at once and how many wait in memory.
+      # They are here, rather than left at their defaults, so that the worker
+      # scaling benchmark can change them from the environment:
+      #   $env:INDEXING_WORKERS=4; docker compose up -d consumer
+      INDEXING_WORKERS: ${INDEXING_WORKERS:-10}
+      INDEXING_QUEUE_SIZE: ${INDEXING_QUEUE_SIZE:-1000}
+      # The consumer has no HTTP API, so it serves its metrics -- Kafka,
+      # retries, dead letters, the worker pool -- on a listener of their own.
+      METRICS_ADDR: ":9091"
+    ports:
+      - "${CONSUMER_METRICS_HOST_PORT:-9091}:9091"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
@@ -276,8 +287,34 @@ services:
         condition: service_healthy
     restart: on-failure:3
 
+  # Scrapes the two Go services. Nothing depends on Prometheus: stopping it
+  # loses the graphs, not the search engine, and neither service notices.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # A week is enough to compare this morning's benchmark with last
+      # Friday's, and small enough not to think about disk.
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Kept so that a restart of the stack does not throw away the history a
+      # benchmark run produced; delete it with `docker compose down -v`.
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+    depends_on:
+      # Only so that the first scrape has something to talk to. Prometheus
+      # starts and keeps running whether or not these are healthy.
+      - api
+      - consumer
+    restart: on-failure:3
+
 volumes:
   postgres-data:
   kafka-data:
   opensearch-data:
   qdrant-data:
+  prometheus-data:

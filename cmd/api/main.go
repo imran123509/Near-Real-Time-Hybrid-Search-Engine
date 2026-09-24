@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"near-real-time-hybrid-search-engine/internal/api"
 	"near-real-time-hybrid-search-engine/internal/config"
 	"near-real-time-hybrid-search-engine/internal/embedding"
+	"near-real-time-hybrid-search-engine/internal/metrics"
 	"near-real-time-hybrid-search-engine/internal/postgres"
 	"near-real-time-hybrid-search-engine/internal/search/hybrid"
 	"near-real-time-hybrid-search-engine/internal/search/opensearch"
@@ -52,7 +54,17 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	level.Set(cfg.App.LogLevel)
-	logger.Info("starting api", "app", cfg.App.Name, "env", cfg.App.Env, "addr", cfg.Server.Addr())
+	logger.Info("starting api", "app", cfg.App.Name, "env", cfg.App.Env, "addr", cfg.Server.Addr(),
+		"metrics_enabled", cfg.Metrics.Enabled, "metrics_path", cfg.Metrics.Path)
+
+	// Built once, before anything that reports into it. The default
+	// registerer already carries the Go runtime and process collectors, so
+	// scraping this endpoint also gives goroutines, memory and GC for free.
+	var m *metrics.Metrics
+	if cfg.Metrics.Enabled {
+		m = metrics.New(prometheus.DefaultRegisterer)
+		m.SetInfo(cfg.App.Name, cfg.App.Env, "api")
+	}
 
 	// Dependencies may still be starting; each is retried until this deadline.
 	initCtx, cancelInit := context.WithTimeout(ctx, cfg.App.StartupTimeout)
@@ -115,20 +127,32 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 	if err != nil {
 		return fmt.Errorf("init hybrid search: %w", err)
 	}
+	// Observation only: the service answers searches exactly as it did
+	// before, and reports afterwards what it did.
+	svc.Observe(m.SearchObserver())
 	logger.Info("hybrid search ready",
 		"default_limit", cfg.Search.DefaultLimit, "max_limit", cfg.Search.MaxLimit,
 		"candidate_limit", cfg.Search.CandidateLimit, "rrf_k", cfg.Search.RRFK, "timeout", cfg.Search.Timeout)
 
-	router := api.NewRouter(
-		api.NewSearchHandler(svc, cfg.Search.Timeout),
-		// The embedding provider has no free health check; a failing provider
-		// shows up as failed searches rather than as not ready.
-		api.NewReadinessHandler(logger,
-			api.ReadinessCheck{Name: "opensearch", Check: osClient.Ping},
-			api.ReadinessCheck{Name: "qdrant", Check: qdClient.Ping},
-		),
-		logger,
+	// The embedding provider has no free health check; a failing provider
+	// shows up as failed searches rather than as not ready.
+	readiness := api.NewReadinessHandler(logger,
+		api.ReadinessCheck{Name: "opensearch", Check: osClient.Ping},
+		api.ReadinessCheck{Name: "qdrant", Check: qdClient.Ping},
 	)
+	readiness.Observe(m.SetReady)
+
+	routerOpts := api.Options{MetricsPath: cfg.Metrics.Path}
+	if cfg.Metrics.Enabled {
+		routerOpts.Metrics = metrics.Handler(prometheus.DefaultGatherer, logger)
+		routerOpts.Middleware = m.Middleware
+		// Nothing else probes readiness on a schedule, and the API's image
+		// has no shell for a container health check, so the gauge would
+		// otherwise only change when somebody asked for /ready. This samples
+		// the same checks the endpoint runs, and stops with the server.
+		go sampleReadiness(ctx, readiness, logger)
+	}
+	router := api.NewRouter(api.NewSearchHandler(svc, cfg.Search.Timeout), readiness, logger, routerOpts)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr(),
@@ -169,6 +193,32 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 	}
 	logger.Info("http server stopped")
 	return nil
+}
+
+// readinessSampleInterval is how often readiness is checked in the
+// background. It is shorter than a typical scrape interval, so the gauge a
+// scrape reads is never stale by more than one sample.
+const readinessSampleInterval = 10 * time.Second
+
+// sampleReadiness keeps application_ready current by running the same checks
+// /ready runs. It returns when ctx is cancelled, which happens on shutdown,
+// so it leaves no goroutine behind.
+func sampleReadiness(ctx context.Context, readiness *api.ReadinessHandler, logger *slog.Logger) {
+	ticker := time.NewTicker(readinessSampleInterval)
+	defer ticker.Stop()
+
+	for {
+		checkCtx, cancel := context.WithTimeout(ctx, readinessSampleInterval)
+		readiness.Check(checkCtx)
+		cancel()
+
+		select {
+		case <-ctx.Done():
+			logger.Debug("readiness sampling stopped")
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func closeWithLog(logger *slog.Logger, name string, closeFn func() error) {

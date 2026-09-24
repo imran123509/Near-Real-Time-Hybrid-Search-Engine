@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +43,13 @@ type Environment struct {
 	Index         string // E2E_OPENSEARCH_INDEX
 	Collection    string // E2E_QDRANT_COLLECTION
 	ConnectorName string // E2E_CONNECTOR_NAME
-	VectorSize    int    // E2E_VECTOR_SIZE
+
+	// MetricsURL and ConsumerMetricsURL are the two Prometheus endpoints: the
+	// API serves its own, and the consumer serves its on a listener of its
+	// own because it has no HTTP API.
+	MetricsURL         string // E2E_METRICS_URL
+	ConsumerMetricsURL string // E2E_CONSUMER_METRICS_URL
+	VectorSize         int    // E2E_VECTOR_SIZE
 
 	// Timeout bounds one "eventually" wait, and PollInterval is how often it
 	// re-checks. The pipeline is eventually consistent, so tests wait for
@@ -67,6 +74,12 @@ func LoadEnvironment() (Environment, error) {
 		Index:         getEnv("E2E_OPENSEARCH_INDEX", "documents"),
 		Collection:    getEnv("E2E_QDRANT_COLLECTION", "documents"),
 		ConnectorName: getEnv("E2E_CONNECTOR_NAME", "documents-cdc"),
+
+		MetricsURL:         getEnv("E2E_METRICS_URL", ""),
+		ConsumerMetricsURL: getEnv("E2E_CONSUMER_METRICS_URL", "http://localhost:9091/metrics"),
+	}
+	if env.MetricsURL == "" {
+		env.MetricsURL = strings.TrimRight(env.APIURL, "/") + "/metrics"
 	}
 	env.DLQTopic = getEnv("E2E_DLQ_TOPIC", env.Topic+".dlq")
 
@@ -607,4 +620,62 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// ----------------------------------------------------------------- Metrics
+
+// FetchMetrics reads a Prometheus endpoint and returns its body.
+func FetchMetrics(ctx context.Context, endpoint string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", endpoint, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s answered %d", endpoint, resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", endpoint, err)
+	}
+	return string(body), nil
+}
+
+// MetricValue sums every series of a metric in an exposition body.
+//
+// Summing is what a counter question usually wants -- "how many searches",
+// not "how many with these labels" -- and it means a test does not have to
+// know which label sets exist. match, when given, keeps only the series whose
+// line contains it, which is how one label value is singled out.
+func MetricValue(body, name, match string) float64 {
+	var total float64
+	for line := range strings.SplitSeq(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// A series line is "name{labels} value" or "name value".
+		if !strings.HasPrefix(line, name) {
+			continue
+		}
+		rest := line[len(name):]
+		if rest == "" || (rest[0] != ' ' && rest[0] != '{') {
+			continue // a longer metric name that starts the same way
+		}
+		if match != "" && !strings.Contains(line, match) {
+			continue
+		}
+		fields := strings.Fields(line)
+		value, err := strconv.ParseFloat(fields[len(fields)-1], 64)
+		if err != nil {
+			continue
+		}
+		total += value
+	}
+	return total
 }

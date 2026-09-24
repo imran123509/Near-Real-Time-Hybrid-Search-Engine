@@ -35,6 +35,7 @@ var optionalVars = []string{
 	"INDEXING_WORKERS", "INDEXING_QUEUE_SIZE", "INDEXING_BATCH_SIZE",
 	"KAFKA_RETRY_MAX_ATTEMPTS", "KAFKA_RETRY_INITIAL_BACKOFF", "KAFKA_RETRY_MAX_BACKOFF", "KAFKA_RETRY_MULTIPLIER",
 	"EMBEDDING_PROVIDER", "EMBEDDING_API_KEY", "EMBEDDING_MODEL", "EMBEDDING_DIMENSION", "EMBEDDING_TIMEOUT",
+	"METRICS_ENABLED", "METRICS_PATH", "METRICS_ADDR",
 }
 
 // setEnv gives every variable a known value: the required ones get valid
@@ -95,6 +96,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 		{"Kafka.Retry.InitialBackoff", cfg.Kafka.Retry.InitialBackoff, 500 * time.Millisecond},
 		{"Kafka.Retry.MaxBackoff", cfg.Kafka.Retry.MaxBackoff, 30 * time.Second},
 		{"Kafka.Retry.Multiplier", cfg.Kafka.Retry.Multiplier, 2.0},
+		{"Metrics.Enabled", cfg.Metrics.Enabled, true},
+		{"Metrics.Path", cfg.Metrics.Path, "/metrics"},
+		{"Metrics.Addr", cfg.Metrics.Addr, ":9091"},
 		{"Embedding.Provider", cfg.Embedding.Provider, "gemini"},
 		{"Embedding.APIKey", cfg.Embedding.APIKey, ""},
 		{"Embedding.Model", cfg.Embedding.Model, "gemini-embedding-2"},
@@ -236,6 +240,9 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"db min conns may be zero", "DATABASE_MIN_CONNS", "0", ""},
 		{"zero queue size", "INDEXING_QUEUE_SIZE", "0", "INDEXING_QUEUE_SIZE must be positive"},
 		{"zero retry attempts", "KAFKA_RETRY_MAX_ATTEMPTS", "0", "KAFKA_RETRY_MAX_ATTEMPTS must be positive"},
+		{"metrics switched off", "METRICS_ENABLED", "false", ""},
+		{"metrics flag is not a bool", "METRICS_ENABLED", "sometimes", "invalid METRICS_ENABLED"},
+		{"metrics path without a slash", "METRICS_PATH", "metrics", "METRICS_PATH must start with /"},
 		{"one attempt disables retrying", "KAFKA_RETRY_MAX_ATTEMPTS", "1", ""},
 		{"invalid retry attempts", "KAFKA_RETRY_MAX_ATTEMPTS", "many", "invalid KAFKA_RETRY_MAX_ATTEMPTS"},
 		{"zero initial backoff", "KAFKA_RETRY_INITIAL_BACKOFF", "0s", "KAFKA_RETRY_INITIAL_BACKOFF must be positive"},

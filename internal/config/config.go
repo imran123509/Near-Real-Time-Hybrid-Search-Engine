@@ -28,6 +28,7 @@ type Config struct {
 	OpenSearch OpenSearchConfig
 	Qdrant     QdrantConfig
 	Indexing   IndexingConfig
+	Metrics    MetricsConfig
 	Embedding  EmbeddingConfig
 	Search     SearchConfig
 }
@@ -144,6 +145,17 @@ type IndexingConfig struct {
 	BatchSize int // INDEXING_BATCH_SIZE
 }
 
+// MetricsConfig holds the Prometheus endpoint's settings. Metrics are on by
+// default: a service that has to be reconfigured before it can be observed
+// tends to be observed only after something has already gone wrong.
+type MetricsConfig struct {
+	Enabled bool   // METRICS_ENABLED
+	Path    string // METRICS_PATH
+	// Addr is the address the consumer serves metrics on. The API serves them
+	// from its own HTTP server and ignores this.
+	Addr string // METRICS_ADDR
+}
+
 // EmbeddingConfig selects and configures the provider that turns text into
 // vectors. It is provider-neutral: switching providers means changing these
 // values, not adding a new group. APIKey is a secret, so never log it.
@@ -245,6 +257,11 @@ func Load() (Config, error) {
 			Workers:   e.int("INDEXING_WORKERS", 10),
 			QueueSize: e.int("INDEXING_QUEUE_SIZE", 1000),
 			BatchSize: e.int("INDEXING_BATCH_SIZE", 100),
+		},
+		Metrics: MetricsConfig{
+			Enabled: e.bool("METRICS_ENABLED", true),
+			Path:    getEnv("METRICS_PATH", "/metrics"),
+			Addr:    getEnv("METRICS_ADDR", ":9091"),
 		},
 		Embedding: EmbeddingConfig{
 			Provider:  strings.ToLower(getEnv("EMBEDDING_PROVIDER", "gemini")),
@@ -352,6 +369,14 @@ func (c Config) validate() error {
 	if m := c.Kafka.Retry.Multiplier; m < 1 || math.IsInf(m, 0) || math.IsNaN(m) {
 		add(fmt.Errorf("KAFKA_RETRY_MULTIPLIER must be a finite number of at least 1, got %v", m))
 	}
+	if c.Metrics.Enabled {
+		if !strings.HasPrefix(c.Metrics.Path, "/") {
+			add(fmt.Errorf("METRICS_PATH must start with /, got %q", c.Metrics.Path))
+		}
+		if c.Metrics.Addr == "" {
+			add(errors.New("METRICS_ADDR must not be empty"))
+		}
+	}
 	add(checkURL("OPENSEARCH_URL", c.OpenSearch.URL))
 	if c.OpenSearch.Index == "" {
 		add(errors.New("OPENSEARCH_INDEX must not be empty"))
@@ -412,6 +437,21 @@ func (e *env) int(key string, fallback int) int {
 func (e *env) duration(key string, fallback time.Duration) time.Duration {
 	v, err := getEnvDuration(key, fallback)
 	e.add(err)
+	return v
+}
+
+// bool parses a flag. Only the forms strconv.ParseBool accepts are allowed,
+// so a misspelled "yes" is a startup error rather than a silent false.
+func (e *env) bool(key string, fallback bool) bool {
+	raw := getEnv(key, "")
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		e.add(fmt.Errorf("invalid %s: want true or false, got %q", key, raw))
+		return fallback
+	}
 	return v
 }
 

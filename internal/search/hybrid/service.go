@@ -57,7 +57,40 @@ type Service struct {
 	embedder Embedder
 	cfg      config.SearchConfig
 	logger   *slog.Logger
+	observe  func(SearchStats)
 }
+
+// SearchStats is what one search did, reported to the function registered with
+// Observe. It holds no query text and no vector: a query can carry personal
+// data, and neither belongs anywhere outside the search itself.
+type SearchStats struct {
+	// QueryLength is the query's length in characters, not the query.
+	QueryLength int
+	Limit       int
+
+	KeywordHits int
+	VectorHits  int
+	Results     int
+
+	KeywordDuration   time.Duration
+	EmbeddingDuration time.Duration
+	VectorDuration    time.Duration
+	FusionDuration    time.Duration
+	Duration          time.Duration
+
+	// Stage names the step that failed: keyword, embedding, vector or
+	// fusion. It is empty when the search succeeded.
+	Stage string
+	// Cancelled is true when the caller gave up or ran out of time, which is
+	// not a failure of this service.
+	Cancelled bool
+	Err       error
+}
+
+// Observe registers a function called once per search, after it finishes. It
+// is where metrics are attached; it must not block, because it runs on the
+// request's own goroutine.
+func (s *Service) Observe(f func(SearchStats)) { s.observe = f }
 
 // New returns a Service that searches with the given dependencies.
 func New(keyword KeywordSearcher, vectors VectorSearcher, embedder Embedder, cfg config.SearchConfig, logger *slog.Logger) (*Service, error) {
@@ -315,11 +348,26 @@ func (s *Service) record(ctx context.Context, st stats, err error) {
 		slog.Duration("duration", st.total),
 	}
 
+	stats := SearchStats{
+		QueryLength:       st.queryLength,
+		Limit:             st.limit,
+		KeywordHits:       st.keywordHits,
+		VectorHits:        st.vectorHits,
+		Results:           st.results,
+		KeywordDuration:   st.keywordTime,
+		EmbeddingDuration: st.embeddingTime,
+		VectorDuration:    st.vectorTime,
+		FusionDuration:    st.fusionTime,
+		Duration:          st.total,
+		Err:               err,
+	}
+
 	switch {
 	case err == nil:
 		s.logger.LogAttrs(ctx, slog.LevelDebug, "hybrid search completed", attrs...)
 	case ctx.Err() != nil:
 		// The caller went away or ran out of time; nothing here failed.
+		stats.Cancelled = true
 		s.logger.LogAttrs(ctx, slog.LevelInfo, "hybrid search cancelled", append(attrs, slog.Any("error", err))...)
 	default:
 		stage := "unknown"
@@ -327,7 +375,12 @@ func (s *Service) record(ctx context.Context, st stats, err error) {
 		if errors.As(err, &se) {
 			stage = se.stage
 		}
+		stats.Stage = stage
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "hybrid search failed",
 			append(attrs, slog.String("stage", stage), slog.Any("error", err))...)
+	}
+
+	if s.observe != nil {
+		s.observe(stats)
 	}
 }

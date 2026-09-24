@@ -53,6 +53,44 @@ type Consumer struct {
 	reader  *kafkago.Reader
 	offsets *offsetTracker
 	logger  *slog.Logger
+	observe func(Event)
+}
+
+// Event is something the consumer did with the broker, reported to the
+// function registered with Observe. It exists so metrics can be attached
+// without this package depending on a metrics library.
+//
+// Kind is one of a fixed set, so it is safe to use as a metric label; the
+// error itself is logged here and never travels into a label.
+type Event struct {
+	Kind  string
+	Topic string
+	Err   error
+}
+
+// The kinds an Event can have.
+const (
+	// EventFetched is one message read from the broker.
+	EventFetched = "fetched"
+	// EventFetchFailed is a failed read. The reader reconnects by itself, so
+	// a few of these are normal; a stream of them is not.
+	EventFetchFailed = "fetch_failed"
+	// EventCommitted is an offset commit the consumer asked for, which means
+	// every message up to that offset is finished.
+	EventCommitted = "committed"
+	// EventCommitFailed is a commit the broker refused. The work was done;
+	// the messages will simply be delivered again.
+	EventCommitFailed = "commit_failed"
+)
+
+// Observe registers a function called for each Event. It runs on the fetch
+// loop or on a worker finishing a message, so it must not block.
+func (c *Consumer) Observe(f func(Event)) { c.observe = f }
+
+func (c *Consumer) report(kind, topic string, err error) {
+	if c.observe != nil {
+		c.observe(Event{Kind: kind, Topic: topic, Err: err})
+	}
 }
 
 // NewConsumer checks that the brokers are reachable and the topic exists, then
@@ -100,6 +138,7 @@ func (c *Consumer) Run(ctx context.Context, submit func(context.Context, Message
 			}
 			// The reader reconnects on its own; give it time before giving up.
 			failures++
+			c.report(EventFetchFailed, c.reader.Config().Topic, err)
 			if failures >= maxFetchFailures {
 				return fmt.Errorf("fetch message: %d consecutive failures: %w", failures, err)
 			}
@@ -112,6 +151,7 @@ func (c *Consumer) Run(ctx context.Context, submit func(context.Context, Message
 			continue
 		}
 		failures = 0
+		c.report(EventFetched, km.Topic, nil)
 
 		if err := submit(ctx, c.track(km)); err != nil {
 			if ctx.Err() != nil {
@@ -152,7 +192,10 @@ func (c *Consumer) track(km kafkago.Message) Message {
 			commit := kafkago.Message{Topic: km.Topic, Partition: km.Partition, Offset: offset}
 			if err := c.reader.CommitMessages(context.Background(), commit); err != nil {
 				c.logger.Error("commit offset failed", "topic", km.Topic, "partition", km.Partition, "offset", offset, "error", err)
+				c.report(EventCommitFailed, km.Topic, err)
+				return
 			}
+			c.report(EventCommitted, km.Topic, nil)
 		},
 	}
 }

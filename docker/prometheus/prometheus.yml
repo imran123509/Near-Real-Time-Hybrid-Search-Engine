@@ -1,0 +1,49 @@
+# Prometheus for local development.
+#
+# It scrapes the two Go services over the Compose network, by service name, on
+# the ports they serve /metrics from:
+#
+#   api       8080   the same server that answers searches
+#   consumer  9091   a listener of its own; the consumer has no HTTP API
+#
+# Nothing in the application depends on this file or on Prometheus running:
+# stopping Prometheus loses the graphs, not the search engine.
+
+global:
+  # Often enough to see a load test's shape, cheap enough to leave running.
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  # Labels added to every series, so that one Prometheus could later hold more
+  # than one environment without them being confused.
+  external_labels:
+    environment: development
+    stack: near-realtime-search
+
+scrape_configs:
+  # The search API. Its metrics cover HTTP traffic, hybrid search latency and
+  # the OpenSearch, embedding and Qdrant calls each search makes.
+  - job_name: hybrid-search-api
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - api:8080
+        labels:
+          service: api
+
+  # The indexing consumer. Its metrics cover Kafka consumption and commits,
+  # retries, the dead-letter topic, the worker pool and the writes to both
+  # search stores.
+  - job_name: hybrid-search-consumer
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - consumer:9091
+        labels:
+          service: consumer
+
+  # Prometheus itself, so that a scrape failure can be told apart from
+  # Prometheus not running at all.
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

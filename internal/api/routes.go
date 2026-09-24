@@ -22,13 +22,40 @@ func RegisterRoutes(mux *http.ServeMux, search *SearchHandler, ready *ReadinessH
 	mux.Handle("/", http.HandlerFunc(notFound))
 }
 
+// Options are the optional parts of the router.
+type Options struct {
+	// Metrics, when set, is served at MetricsPath. It is a plain
+	// http.Handler, so this package needs to know nothing about Prometheus.
+	Metrics     http.Handler
+	MetricsPath string
+	// Middleware wraps every route, metrics endpoint included. It is where
+	// request measurement is attached.
+	Middleware func(http.Handler) http.Handler
+}
+
 // NewRouter returns the server's complete handler: the routes behind request
 // ID, access logging and panic recovery middleware, in that order from the
 // outside in, so that even a request that panics is logged with its ID.
-func NewRouter(search *SearchHandler, ready *ReadinessHandler, logger *slog.Logger) http.Handler {
+func NewRouter(search *SearchHandler, ready *ReadinessHandler, logger *slog.Logger, opts Options) http.Handler {
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, search, ready)
-	return withRequestID(withLogging(logger, withRecovery(logger, mux)))
+
+	// The metrics endpoint lives on the same server as everything else: one
+	// port to publish, one server to shut down, and a scrape that proves the
+	// server answering searches is the one being measured.
+	if opts.Metrics != nil {
+		path := opts.MetricsPath
+		if path == "" {
+			path = "/metrics"
+		}
+		mux.Handle(path, allowMethods(http.MethodGet, opts.Metrics))
+	}
+
+	var handler http.Handler = mux
+	if opts.Middleware != nil {
+		handler = opts.Middleware(handler)
+	}
+	return withRequestID(withLogging(logger, withRecovery(logger, handler)))
 }
 
 // allowMethods answers requests with any other method with a JSON 405. GET

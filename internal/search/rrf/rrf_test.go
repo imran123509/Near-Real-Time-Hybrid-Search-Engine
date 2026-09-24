@@ -270,19 +270,5 @@ func TestLargeKDoesNotOverflow(t *testing.T) {
 	}
 }
 
-func BenchmarkFuseTwoLists(b *testing.B) {
-	keyword := make([]Result, 100)
-	vector := make([]Result, 100)
-	for i := range 100 {
-		keyword[i] = Result{ID: fmt.Sprintf("doc-%d", i)}
-		vector[i] = Result{ID: fmt.Sprintf("doc-%d", (i*7)%150)}
-	}
-	sets := [][]Result{keyword, vector}
-
-	b.ReportAllocs()
-	for b.Loop() {
-		if _, err := Fuse(sets, DefaultK, 10); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
+// The benchmarks live in rrf_bench_test.go, where BenchmarkFuse measures this
+// same two-list case across a range of sizes.
