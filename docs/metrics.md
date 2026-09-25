@@ -255,7 +255,14 @@ To watch failure and recovery, use the benchmark suite's recovery run
 then `kafka_dlq_messages_total` rise in that order; starting it again brings
 `application_ready` back to 1 and the failure rates back to zero.
 
+## Dashboards
+
+Grafana draws these metrics, provisioned with the stack at
+http://localhost:3000. See [grafana.md](grafana.md).
+
 ## What is not here
 
-No Grafana dashboards, no tracing, no OpenTelemetry, no alerting rules. This
-feature exposes the numbers; reading them on a dashboard comes next.
+No tracing, no OpenTelemetry, no alerting rules, and no exporters for
+PostgreSQL or the Kafka broker. This exposes what the application measures
+about itself and its dependencies; monitoring those services from the inside
+is a separate decision.

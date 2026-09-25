@@ -79,6 +79,9 @@ docker compose down -v    # deletes the database, topics and indexes
 | `TestOpenSearchFailureRecovery`, `TestQdrantFailureRecovery`, `TestRetryIdempotency` | Opt-in: with one search index stopped, nothing is lost or duplicated, and both indexes converge on the newest row once it is back |
 | `TestMetricsEndpointsAreServed`, `TestSearchMovesTheMetrics`, `TestIndexingMovesTheMetrics` | Both services expose Prometheus metrics, and searching and indexing move the counters that describe them |
 | `TestDocumentIDsNeverReachLabels`, `TestRejectedRequestsAreCountedSeparately` | No document ID or search term reaches a metric label, and a rejected request is a 4xx rather than a search failure |
+| `TestPrometheusScrapesBothServices`, `TestPrometheusHasApplicationMetrics` | Prometheus is scraping the API and the consumer, and holds their metrics |
+| `TestGrafanaIsProvisioned` | Grafana came up with its Prometheus datasource and all five dashboards, with nothing imported by hand |
+| `TestDashboardQueriesReturnData` | The queries behind the main panels still return data, so a renamed metric cannot quietly blank a dashboard |
 | `TestRealEmbeddingProvider` | Opt-in: finds a document by meaning alone, with words it does not contain |
 
 Every test creates its own document with a unique ID and a unique marker word,
@@ -144,6 +147,8 @@ Failure is injected by stopping the real service. Nothing in `cmd/` or
 | `E2E_DLQ_TOPIC` | `<E2E_TOPIC>.dlq` | Where the dead-letter test reads from |
 | `E2E_METRICS_URL` | `<E2E_API_URL>/metrics` | The API's Prometheus endpoint |
 | `E2E_CONSUMER_METRICS_URL` | `http://localhost:9091/metrics` | The consumer's Prometheus endpoint |
+| `E2E_PROMETHEUS_URL` | `http://localhost:9090` | Prometheus |
+| `E2E_GRAFANA_URL` | `http://localhost:3000` | Grafana |
 | `E2E_OPENSEARCH_INDEX` / `E2E_QDRANT_COLLECTION` | `documents` | |
 | `E2E_VECTOR_SIZE` | `768` | Must match `EMBEDDING_DIMENSION` |
 | `E2E_TIMEOUT` | `90s` | How long one "eventually" waits |

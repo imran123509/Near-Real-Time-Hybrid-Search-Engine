@@ -34,8 +34,8 @@ HTTP client ──> api ──┬──> OpenSearch ─────────�
 - `internal/config` – configuration loading
 - `tests/e2e` – end-to-end tests against the running stack
 - `migrations/` – database migrations
-- `docker/` – PostgreSQL initialisation, the Debezium connector and the Prometheus scrape configuration
-- `docs/` – [metrics reference](docs/metrics.md)
+- `docker/` – PostgreSQL initialisation, the Debezium connector, and the Prometheus and Grafana configuration
+- `docs/` – [metrics reference](docs/metrics.md), [dashboards](docs/grafana.md)
 - `scripts/` – Debezium connector registration, the end-to-end runner and the benchmarks
 - `benchmarks/` – k6 search load tests and the results template
 
@@ -97,6 +97,7 @@ they tolerate starting before them outside Compose too, without retrying forever
 | Qdrant | http://localhost:6333 (REST, dashboard at `/dashboard`), localhost:6334 (gRPC) | |
 | Consumer metrics | http://localhost:9091/metrics | the consumer has no other HTTP endpoint |
 | Prometheus | http://localhost:9090 | scrapes the api and the consumer every 15s |
+| Grafana | http://localhost:3000 | dashboards; reading them needs no login |
 
 ### Everyday commands
 
@@ -500,17 +501,24 @@ scripts/e2e.sh         # macOS, Linux, Git Bash
 They need no embedding API key, and `go test ./...` skips them unless `E2E` is
 set. See [tests/e2e/README.md](tests/e2e/README.md).
 
-## Metrics
+## Metrics and dashboards
 
-Both services expose Prometheus metrics, and Prometheus scrapes them every 15
-seconds:
+Both services expose Prometheus metrics, Prometheus scrapes them every 15
+seconds, and Grafana draws them:
 
 ```text
 api       :8080/metrics   HTTP traffic, search latency, the calls each search makes
 consumer  :9091/metrics   Kafka, retries, dead letters, indexing, the worker pool
                 ↓
            Prometheus :9090
+                ↓
+             Grafana :3000
 ```
+
+Grafana comes up with its datasource and five dashboards already provisioned —
+Overview, Search API, Kafka & Indexing, Dependencies and Runtime — so
+`docker compose up -d` is the whole setup. Reading them needs no login; the
+whole stack is local-development only. See [docs/grafana.md](docs/grafana.md).
 
 ```powershell
 curl.exe -s http://localhost:8080/metrics | Select-String hybrid_search_search_requests_total

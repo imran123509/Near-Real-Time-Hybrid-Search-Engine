@@ -49,7 +49,11 @@ type Environment struct {
 	// own because it has no HTTP API.
 	MetricsURL         string // E2E_METRICS_URL
 	ConsumerMetricsURL string // E2E_CONSUMER_METRICS_URL
-	VectorSize         int    // E2E_VECTOR_SIZE
+	// PrometheusURL and GrafanaURL are the observability stack. Nothing the
+	// application does depends on either being up.
+	PrometheusURL string // E2E_PROMETHEUS_URL
+	GrafanaURL    string // E2E_GRAFANA_URL
+	VectorSize    int    // E2E_VECTOR_SIZE
 
 	// Timeout bounds one "eventually" wait, and PollInterval is how often it
 	// re-checks. The pipeline is eventually consistent, so tests wait for
@@ -77,6 +81,8 @@ func LoadEnvironment() (Environment, error) {
 
 		MetricsURL:         getEnv("E2E_METRICS_URL", ""),
 		ConsumerMetricsURL: getEnv("E2E_CONSUMER_METRICS_URL", "http://localhost:9091/metrics"),
+		PrometheusURL:      getEnv("E2E_PROMETHEUS_URL", "http://localhost:9090"),
+		GrafanaURL:         getEnv("E2E_GRAFANA_URL", "http://localhost:3000"),
 	}
 	if env.MetricsURL == "" {
 		env.MetricsURL = strings.TrimRight(env.APIURL, "/") + "/metrics"

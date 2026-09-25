@@ -1,0 +1,24 @@
+# The Prometheus datasource, configured before Grafana first starts.
+#
+# Nothing has to be clicked through the UI: the dashboards in
+# docker/grafana/dashboards reference this datasource by the uid below, so
+# they work on a fresh container with no state at all.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # A fixed uid, because every dashboard panel names it. Changing it means
+    # changing every dashboard, so treat it as part of the file format.
+    uid: prometheus
+    access: proxy
+    # The Compose service name and its port; the browser never talks to
+    # Prometheus directly, Grafana proxies for it.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # Matches global.scrape_interval in docker/prometheus/prometheus.yml, so
+      # Grafana does not ask for finer steps than the data has.
+      timeInterval: 15s
+      httpMethod: POST

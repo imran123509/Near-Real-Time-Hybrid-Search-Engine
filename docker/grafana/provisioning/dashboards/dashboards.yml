@@ -1,0 +1,23 @@
+# Loads every dashboard in docker/grafana/dashboards at startup, and again
+# whenever one of the files changes.
+#
+# The dashboards are read from a read-only mount, so Grafana keeps them in
+# step with what is in git rather than with what somebody edited in the UI:
+# an edit made in the browser can be explored and exported, but it is replaced
+# by the file on the next reload. That is what makes the dashboards
+# reproducible.
+apiVersion: 1
+
+providers:
+  - name: near-realtime-search
+    orgId: 1
+    folder: Near Real-Time Search
+    type: file
+    # Each dashboard carries its own uid, so reloading updates the existing
+    # dashboard instead of creating a copy beside it.
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

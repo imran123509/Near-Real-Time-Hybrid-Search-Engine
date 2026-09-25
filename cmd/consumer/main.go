@@ -173,6 +173,11 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 		m.BindWorkerPool(workers.Stats)
 		stopMetrics := serveMetrics(cfg.Metrics, logger)
 		defer stopMetrics()
+		// Without this the readiness gauge would sit at 0 for the whole life
+		// of the consumer, which reads as "broken" on a dashboard. The
+		// consumer has no /ready endpoint to drive it, so it samples the same
+		// dependencies the API's readiness check uses.
+		go sampleReadiness(ctx, m, logger, osClient.Ping, qdClient.Ping)
 	}
 
 	logger.Info("consuming messages")
@@ -206,6 +211,42 @@ func run(logger *slog.Logger, level *slog.LevelVar) error {
 // metricsShutdownTimeout bounds how long a scrape in progress may hold up
 // shutdown. Metrics must never be the reason a consumer takes long to stop.
 const metricsShutdownTimeout = 3 * time.Second
+
+// readinessSampleInterval is how often the consumer checks the stores it
+// writes to. It is shorter than a scrape interval, so the gauge a scrape
+// reads is never stale by more than one sample.
+const readinessSampleInterval = 10 * time.Second
+
+// sampleReadiness keeps application_ready current for the consumer, which
+// serves no readiness endpoint of its own.
+//
+// It reports whether the stores it writes to answer, which is the same
+// question the API's /ready asks of the same two services. It returns when
+// ctx is cancelled, so it leaves no goroutine behind, and a failing check
+// only moves a gauge: nothing about consuming or committing depends on it.
+func sampleReadiness(ctx context.Context, m *metrics.Metrics, logger *slog.Logger, checks ...func(context.Context) error) {
+	ticker := time.NewTicker(readinessSampleInterval)
+	defer ticker.Stop()
+
+	for {
+		checkCtx, cancel := context.WithTimeout(ctx, readinessSampleInterval)
+		ready := true
+		for _, check := range checks {
+			if err := check(checkCtx); err != nil {
+				ready = false
+				logger.LogAttrs(checkCtx, slog.LevelWarn, "readiness check failed", slog.Any("error", err))
+			}
+		}
+		cancel()
+		m.SetReady(ready)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
 
 // serveMetrics starts the metrics listener and returns the function that
 // stops it. A failure to listen is logged and nothing else: losing metrics

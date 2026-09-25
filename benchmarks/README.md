@@ -250,6 +250,11 @@ curl.exe -s http://localhost:8080/metrics | Select-String "search_requests_total
 curl.exe -s http://localhost:9091/metrics | Select-String "kafka_messages_total|indexing_queue_size"
 ```
 
+Grafana draws the same numbers at http://localhost:3000 — the **Search API**
+dashboard during a search run, **Kafka & Indexing** during an indexing,
+backpressure or recovery run, and **Runtime** to check that goroutines come
+back down and consumer memory stays flat. See [docs/grafana.md](../docs/grafana.md).
+
 Expect them to agree roughly, not exactly. k6 counts requests it sent, and the
 API counts requests it answered: a connection refused or a request that timed
 out client-side never reaches the server's counter. A gap in one direction is
